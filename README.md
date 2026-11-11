@@ -70,7 +70,7 @@ BLACKOUT یک فریمورک حمله‌ی لایه‌ی هفتم است که ح
 یک خطی:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/coderuseplayer-netizen/subscriptionlink-panel-DoS-ATTACK/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/NULLByte-ROOT/NODE-DDoS-ATTACK-L7-L4/tree/main/install.sh)
 ```
 
 نصب‌کننده این کارها را انجام می‌دهد:
