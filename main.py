@@ -2814,11 +2814,151 @@ def _sock_read_exact(sock, n, deadline):
     return b"".join(chunks)
 
 
-def h2_hardening_probe(host, port=443, timeout=8.0):
+def _cve_parse_proxy_url(p):
+    if not p:
+        return None
+    p = str(p).strip()
+    if not p:
+        return None
+    if "://" not in p:
+        p = "http://" + p
+    try:
+        u = urlparse(p)
+        scheme = (u.scheme or "http").lower()
+        if scheme == "socks5h":
+            scheme = "socks5"
+        if scheme not in ("socks5", "socks4", "http", "https"):
+            return None
+        host = u.hostname
+        port = u.port
+        if not host or not port:
+            return None
+        return scheme, host, int(port), u.username, u.password
+    except Exception:
+        return None
+
+
+def _sync_connect_via_proxy(proxy, host, port, timeout):
+    parsed = _cve_parse_proxy_url(proxy)
+    if parsed is None:
+        raise ValueError(f"invalid proxy: {proxy}")
+    scheme, phost, pport, puser, ppwd = parsed
+
+    sock = socket.create_connection((phost, pport), timeout=timeout)
+    sock.settimeout(timeout)
+    deadline = time.monotonic() + timeout
+    try:
+        if scheme == "socks5":
+            if puser:
+                sock.sendall(b"\x05\x02\x00\x02")
+            else:
+                sock.sendall(b"\x05\x01\x00")
+            hdr = _sock_read_exact(sock, 2, deadline)
+            if len(hdr) != 2 or hdr[0] != 0x05:
+                raise ConnectionError("socks5: bad greeting")
+            method = hdr[1]
+            if method == 0x02:
+                u = (puser or "").encode()
+                pw = (ppwd or "").encode()
+                sock.sendall(bytes([0x01, len(u)]) + u + bytes([len(pw)]) + pw)
+                auth = _sock_read_exact(sock, 2, deadline)
+                if len(auth) != 2 or auth[1] != 0x00:
+                    raise ConnectionError("socks5: auth failed")
+            elif method != 0x00:
+                raise ConnectionError("socks5: no acceptable auth")
+
+            try:
+                addr = socket.inet_aton(host)
+                atyp = 0x01
+            except OSError:
+                hb = host.encode()
+                atyp = 0x03
+                addr = bytes([len(hb)]) + hb
+            req = bytes([0x05, 0x01, 0x00, atyp]) + addr + int(port).to_bytes(2, "big")
+            sock.sendall(req)
+            resp = _sock_read_exact(sock, 4, deadline)
+            if len(resp) < 4 or resp[1] != 0x00:
+                code = resp[1] if len(resp) > 1 else -1
+                raise ConnectionError(f"socks5: connect failed code={code}")
+            if resp[3] == 0x01:
+                _sock_read_exact(sock, 6, deadline)
+            elif resp[3] == 0x03:
+                ln = _sock_read_exact(sock, 1, deadline)
+                if ln:
+                    _sock_read_exact(sock, ln[0] + 2, deadline)
+            elif resp[3] == 0x04:
+                _sock_read_exact(sock, 18, deadline)
+
+        elif scheme == "socks4":
+            uid = (puser or "").encode()
+            try:
+                addr = socket.inet_aton(host)
+                req = (b"\x04\x01" + int(port).to_bytes(2, "big") +
+                       addr + uid + b"\x00")
+            except OSError:
+                hb = host.encode()
+                req = (b"\x04\x01" + int(port).to_bytes(2, "big") +
+                       b"\x00\x00\x00\x01" + uid + b"\x00" + hb + b"\x00")
+            sock.sendall(req)
+            resp = _sock_read_exact(sock, 8, deadline)
+            if len(resp) < 2 or resp[1] != 0x5A:
+                code = resp[1] if len(resp) > 1 else -1
+                raise ConnectionError(f"socks4: connect failed code={code}")
+
+        else:
+            req = f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n"
+            if puser:
+                token = base64.b64encode(
+                    f"{puser}:{ppwd or ''}".encode()).decode()
+                req += f"Proxy-Authorization: Basic {token}\r\n"
+            req += "Proxy-Connection: keep-alive\r\n\r\n"
+            sock.sendall(req.encode())
+
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                chunk = sock.recv(2048)
+                if not chunk:
+                    raise ConnectionError("http-proxy: closed")
+                buf += chunk
+                if len(buf) > 32768:
+                    break
+            if not (buf.startswith(b"HTTP/1.1 200") or
+                    buf.startswith(b"HTTP/1.0 200")):
+                line = buf.split(b"\r\n", 1)[0].decode(errors="ignore")
+                raise ConnectionError(f"http-proxy: {line}")
+
+        return sock
+    except Exception:
+        try:
+            sock.close()
+        except Exception:
+            pass
+        raise
+
+
+def _cve_pick_proxy():
+    pool = list(PROXY_MANAGER.working_proxies) if PROXY_MANAGER else []
+    if not pool:
+        return None
+    mode = PROXY_MANAGER.rotation_mode
+    if mode == "round_robin":
+        PROXY_MANAGER._cve_rr = (getattr(PROXY_MANAGER, "_cve_rr", 0) + 1) % len(pool)
+        return pool[PROXY_MANAGER._cve_rr]
+    if mode == "weighted":
+        weights = []
+        for p in pool:
+            lat = PROXY_MANAGER.proxy_stats.get(p, {}).get("latency_ms", 1000)
+            weights.append(max(1, 5000 - lat))
+        return random.choices(pool, weights=weights, k=1)[0]
+    return random.choice(pool)
+
+
+def h2_hardening_probe(host, port=443, timeout=8.0, proxy=None):
     """Read-only HTTP/2 SETTINGS probe.
 
-    Opens one TLS connection with ALPN=h2, sends the client preface plus an
-    empty SETTINGS frame, reads the server SETTINGS frame, acknowledges it and
+    Opens one TLS connection with ALPN=h2 (directly or through a SOCKS4 /
+    SOCKS5 / HTTP CONNECT proxy), sends the client preface plus an empty
+    SETTINGS frame, reads the server SETTINGS frame, acknowledges it and
     closes with GOAWAY. It never sends HEADERS or RST_STREAM, so it cannot
     generate attack traffic.
     """
@@ -2826,6 +2966,7 @@ def h2_hardening_probe(host, port=443, timeout=8.0):
         "ok": False,
         "host": host,
         "port": port,
+        "proxy": proxy,
         "error": None,
         "alpn": None,
         "tls_version": None,
@@ -2848,7 +2989,10 @@ def h2_hardening_probe(host, port=443, timeout=8.0):
             pass
 
         t0 = time.perf_counter()
-        raw = socket.create_connection((host, port), timeout=timeout)
+        if proxy:
+            raw = _sync_connect_via_proxy(proxy, host, port, timeout)
+        else:
+            raw = socket.create_connection((host, port), timeout=timeout)
         try:
             tls = ctx.wrap_socket(raw, server_hostname=host)
         except Exception:
@@ -2857,6 +3001,7 @@ def h2_hardening_probe(host, port=443, timeout=8.0):
             except Exception:
                 pass
             raise
+
 
         result["handshake_ms"] = int((time.perf_counter() - t0) * 1000)
         result["tls_version"] = tls.version()
@@ -2998,13 +3143,14 @@ def cve_save_leaderboard(entries):
         pass
 
 
-def cve_record_score(probe, score, grade):
+def cve_record_score(probe, score, grade, samples=None, success=None,
+                     proxy=False):
     entries = cve_load_leaderboard()
     host = probe.get("host")
     port = probe.get("port")
     entries = [e for e in entries
                if not (e.get("host") == host and e.get("port") == port)]
-    entries.append({
+    entry = {
         "host": host,
         "port": port,
         "score": int(score),
@@ -3013,7 +3159,13 @@ def cve_record_score(probe, score, grade):
         "tls": probe.get("tls_version"),
         "handshake_ms": probe.get("handshake_ms", 0),
         "ts": now_dt().strftime("%Y-%m-%d %H:%M:%S"),
-    })
+    }
+    if samples is not None:
+        entry["samples"] = int(samples)
+    if success is not None:
+        entry["success"] = int(success)
+    entry["proxy"] = bool(proxy)
+    entries.append(entry)
     entries.sort(key=lambda e: (-int(e.get("score", 0)), str(e.get("host", ""))))
     entries = entries[:50]
     cve_save_leaderboard(entries)
@@ -3163,6 +3315,139 @@ def cve_print_probe_report(probe, score, grade, checks):
     print()
 
 
+def _cve_most_common(values):
+    counts = {}
+    for v in values:
+        if v is None:
+            continue
+        key = str(v)
+        counts[key] = counts.get(key, 0) + 1
+    if not counts:
+        return None
+    best = max(counts.items(), key=lambda kv: (kv[1], kv[0]))[0]
+    for v in values:
+        if v is not None and str(v) == best:
+            return v
+    return None
+
+
+def cve_aggregate_samples(samples, host, port):
+    good = [s for s in samples if s.get("ok")]
+    agg = {
+        "ok": bool(good),
+        "host": host,
+        "port": port,
+        "error": None,
+        "alpn": None,
+        "tls_version": None,
+        "cipher": None,
+        "handshake_ms": 0,
+        "frames": 0,
+        "settings": {},
+        "settings_ack": False,
+        "goaway": False,
+        "samples": len(samples),
+        "success": len(good),
+    }
+    if not good:
+        agg["error"] = samples[-1].get("error") if samples else "no samples"
+        return agg
+
+    keys = set()
+    for s in good:
+        keys.update((s.get("settings") or {}).keys())
+    settings = {}
+    for k in sorted(keys):
+        vals = [s["settings"][k] for s in good if k in (s.get("settings") or {})]
+        settings[k] = _cve_most_common(vals)
+    agg["settings"] = settings
+    agg["alpn"] = _cve_most_common([s.get("alpn") for s in good])
+    agg["tls_version"] = _cve_most_common([s.get("tls_version") for s in good])
+    agg["cipher"] = _cve_most_common([s.get("cipher") for s in good])
+    agg["frames"] = _cve_most_common([s.get("frames") for s in good]) or 0
+    latencies = sorted(int(s.get("handshake_ms", 0)) for s in good)
+    agg["handshake_ms"] = latencies[len(latencies) // 2]
+    return agg
+
+
+async def cve_run_probe_session(host, port, interval, duration, timeout,
+                                use_proxy):
+    start = time.monotonic()
+    samples = []
+    used_proxies = {}
+    errors = {}
+    idx = 0
+
+    while True:
+        if _INTERRUPTED[0]:
+            break
+        if duration > 0 and (time.monotonic() - start) >= duration:
+            break
+
+        idx += 1
+        proxy = _cve_pick_proxy() if use_proxy else None
+        probe = await asyncio.to_thread(
+            h2_hardening_probe, host, port, timeout, proxy)
+        probe["proxy"] = proxy
+        samples.append(probe)
+
+        if probe.get("ok"):
+            score, grade, _ = cve_h2_score(probe)
+            if proxy:
+                used_proxies[proxy] = used_proxies.get(proxy, 0) + 1
+                via = f"{Colors.MAGENTA}via {short_proxy(proxy)}{Colors.RESET}"
+            else:
+                via = f"{Colors.DIM}via DIRECT{Colors.RESET}"
+            print(f"  {Colors.DIM}#{idx:03d}{Colors.RESET}  "
+                  f"{Colors.GREEN}OK{Colors.RESET}  "
+                  f"score {Colors.BOLD}{score:>3}{Colors.RESET} ({grade})  "
+                  f"{Colors.DIM}{probe.get('tls_version') or '—'}  "
+                  f"{probe.get('handshake_ms', 0)}ms{Colors.RESET}  {via}")
+        else:
+            err = probe.get("error") or "no SETTINGS frame"
+            errors[err] = errors.get(err, 0) + 1
+            print(f"  {Colors.DIM}#{idx:03d}{Colors.RESET}  "
+                  f"{Colors.RED}FAIL{Colors.RESET}  "
+                  f"{Colors.DIM}{err[:64]}{Colors.RESET}")
+
+        if duration > 0:
+            remaining = duration - (time.monotonic() - start)
+            if remaining <= 0:
+                break
+            await interruptible_sleep(min(interval, remaining))
+        else:
+            await interruptible_sleep(interval)
+
+    elapsed = time.monotonic() - start
+    return samples, used_proxies, errors, elapsed
+
+
+def cve_print_session_summary(samples, agg, used_proxies, elapsed):
+    total = len(samples)
+    ok = agg.get("success", 0)
+    print(f"  {Colors.BOLD}● PROBE SESSION{Colors.RESET}")
+    print(f"  {Colors.DIM}{'─' * 76}{Colors.RESET}")
+    print(f"  {Colors.DIM}├─{Colors.RESET} Duration     "
+          f"{int(elapsed)}s")
+    print(f"  {Colors.DIM}├─{Colors.RESET} Samples      "
+          f"{Colors.BOLD}{total}{Colors.RESET}  "
+          f"{Colors.DIM}(ok {ok} · fail {total - ok}){Colors.RESET}")
+    rate = (ok * 100.0 / total) if total else 0.0
+    rate_color = Colors.GREEN if rate >= 90 else (
+        Colors.YELLOW if rate >= 50 else Colors.RED)
+    print(f"  {Colors.DIM}├─{Colors.RESET} Success rate "
+          f"{rate_color}{rate:.1f}%{Colors.RESET}")
+    if used_proxies:
+        print(f"  {Colors.DIM}├─{Colors.RESET} Proxies used "
+              f"{Colors.BOLD}{len(used_proxies)}{Colors.RESET}")
+    else:
+        print(f"  {Colors.DIM}├─{Colors.RESET} Proxies used "
+              f"{Colors.DIM}direct mode{Colors.RESET}")
+    print(f"  {Colors.DIM}└─{Colors.RESET} Aggregation  "
+          f"{Colors.DIM}median handshake · most-common SETTINGS{Colors.RESET}")
+    print()
+
+
 def cve_print_leaderboard():
     entries = cve_load_leaderboard()
     print(f"\n  {Colors.BOLD}{Colors.MAGENTA}● HARDENING LEADERBOARD{Colors.RESET}  "
@@ -3171,8 +3456,8 @@ def cve_print_leaderboard():
         print(f"  {Colors.YELLOW}⚠{Colors.RESET} No scores yet. Run the probe first.\n")
         return
 
-    print(f"  {Colors.DIM}{'RANK':<6} {'HOST':<34} {'SCORE':>6}  "
-          f"{'GRADE':<6} {'TLS':<9} {'WHEN'}{Colors.RESET}")
+    print(f"  {Colors.DIM}{'RANK':<6} {'HOST':<30} {'SCORE':>5}  "
+          f"{'GRADE':<5} {'RUNS':>4}  {'TLS':<8} {'WHEN'}{Colors.RESET}")
     print(f"  {Colors.DIM}{'─' * 88}{Colors.RESET}")
     for i, e in enumerate(entries, 1):
         grade = str(e.get("grade", "?"))
@@ -3180,16 +3465,19 @@ def cve_print_leaderboard():
             Colors.YELLOW if grade in ("C", "D") else Colors.RED)
         medal = "●" if i == 1 else f"{i:>2}"
         host = f"{e.get('host', '?')}:{e.get('port', 443)}"
-        if len(host) > 33:
-            host = host[:30] + "..."
-        print(f"  {Colors.CYAN}{medal:<6}{Colors.RESET} {host:<34} "
-              f"{Colors.BOLD}{e.get('score', 0):>6}{Colors.RESET}  "
-              f"{gc}{grade:<6}{Colors.RESET} "
-              f"{Colors.DIM}{str(e.get('tls') or '—'):<9} "
+        if e.get("proxy"):
+            host += " *"
+        if len(host) > 29:
+            host = host[:26] + "..."
+        runs = e.get("samples", 1)
+        print(f"  {Colors.CYAN}{medal:<6}{Colors.RESET} {host:<30} "
+              f"{Colors.BOLD}{e.get('score', 0):>5}{Colors.RESET}  "
+              f"{gc}{grade:<5}{Colors.RESET} {runs:>4}  "
+              f"{Colors.DIM}{str(e.get('tls') or '—'):<8} "
               f"{e.get('ts', '')}{Colors.RESET}")
     print()
     print(f"  {Colors.DIM}  Highest score wins. Re-probing a host replaces its"
-          f" old score.{Colors.RESET}\n")
+          f" old score.  * = probed through proxies{Colors.RESET}\n")
 
 
 def cve_export_report():
@@ -3222,13 +3510,14 @@ def cve_export_report():
     lines.append("## Hardening leaderboard")
     lines.append("")
     if entries:
-        lines.append("| Rank | Host | Score | Grade | TLS | Probed at |")
-        lines.append("| --- | --- | --- | --- | --- | --- |")
+        lines.append("| Rank | Host | Score | Grade | Samples | TLS | Proxied | Probed at |")
+        lines.append("| --- | --- | --- | --- | --- | --- | --- | --- |")
         for i, e in enumerate(entries, 1):
             lines.append(
                 f"| {i} | {e.get('host')}:{e.get('port')} | "
                 f"{e.get('score')} | {e.get('grade')} | "
-                f"{e.get('tls') or '—'} | {e.get('ts')} |"
+                f"{e.get('samples', 1)} | {e.get('tls') or '—'} | "
+                f"{'yes' if e.get('proxy') else 'no'} | {e.get('ts')} |"
             )
     else:
         lines.append("_No probes recorded yet._")
@@ -3268,7 +3557,7 @@ async def cve_arsenal_menu():
                   f"{Colors.BOLD}{Colors.MAGENTA}{len(board):>5}{Colors.RESET}")
             print(f"  {Colors.DIM}└─{Colors.RESET} Probe mode        "
                   f"{Colors.GREEN}read-only{Colors.RESET}  "
-                  f"{Colors.DIM}(SETTINGS only · no HEADERS · no RST_STREAM){Colors.RESET}")
+                  f"{Colors.DIM}(SETTINGS only · proxy-aware · no HEADERS/RST_STREAM){Colors.RESET}")
             print()
 
             print(f"  {Colors.BOLD}● OPERATIONS{Colors.RESET}")
@@ -3321,6 +3610,8 @@ async def cve_arsenal_menu():
                 print(f"  {Colors.DIM}  Read-only: negotiates h2, reads the SETTINGS frame,")
                 print(f"  sends GOAWAY and closes. No request and no stream reset")
                 print(f"  is ever sent, so this cannot flood the target.{Colors.RESET}\n")
+
+                print(f"  {Colors.BOLD}● TARGET CONFIGURATION{Colors.RESET}\n")
                 raw = safe_input(
                     f"  {Colors.BOLD}➜ Target host (e.g. example.com or host:8443): {Colors.RESET}"
                 ).strip()
@@ -3329,6 +3620,32 @@ async def cve_arsenal_menu():
                     print(f"\n  {Colors.RED}⚠{Colors.RESET} Invalid host\n")
                     safe_input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
                     continue
+
+                interval = get_int_input(
+                    f"  {Colors.BOLD}➜ Probe interval (seconds) [{Colors.GREEN}5{Colors.RESET}]: ",
+                    5, max_val=3600)
+                dur_min = get_int_input(
+                    f"  {Colors.BOLD}➜ Probe window (minutes, 0=until Ctrl+C) "
+                    f"[{Colors.GREEN}1{Colors.RESET}]: ",
+                    1, allow_zero=True, max_val=1440)
+                timeout = get_int_input(
+                    f"  {Colors.BOLD}➜ Per-probe timeout (seconds) [{Colors.GREEN}8{Colors.RESET}]: ",
+                    8, max_val=60)
+
+                use_proxy = False
+                if PROXY_MANAGER.working_proxies:
+                    print(f"\n  {Colors.DIM}●{Colors.RESET} Proxy pool  "
+                          f"{Colors.GREEN}{len(PROXY_MANAGER.working_proxies)} alive{Colors.RESET}  "
+                          f"{Colors.DIM}|{Colors.RESET}  mode: "
+                          f"{Colors.YELLOW}{PROXY_MANAGER.rotation_mode}{Colors.RESET}")
+                    ans = safe_input(
+                        f"  {Colors.BOLD}➜ Use proxy rotation? "
+                        f"({Colors.GREEN}{len(PROXY_MANAGER.working_proxies)} available{Colors.RESET}) "
+                        f"[{Colors.GREEN}Y{Colors.RESET}/n]: ").strip().lower()
+                    use_proxy = (ans != "n")
+                else:
+                    print(f"\n  {Colors.DIM}●{Colors.RESET} No working proxies loaded "
+                          f"{Colors.DIM}— direct mode{Colors.RESET}")
 
                 print(f"\n  {Colors.YELLOW}⚠{Colors.RESET}  Only probe hosts you own or are explicitly")
                 print(f"  {Colors.YELLOW}⚠{Colors.RESET}  authorised to test.\n")
@@ -3341,19 +3658,54 @@ async def cve_arsenal_menu():
                     safe_input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
                     continue
 
-                print(f"  {Colors.CYAN}➜ Probing {host}:{port} ...{Colors.RESET}")
-                probe = await asyncio.to_thread(h2_hardening_probe, host, port, 8.0)
+                duration = dur_min * 60
+                window_txt = ("until Ctrl+C" if duration <= 0
+                              else f"{dur_min} min")
+                via_txt = ("proxy rotation" if use_proxy else "direct")
+                print(f"\n  {Colors.CYAN}➜ Starting probe session on "
+                      f"{host}:{port}{Colors.RESET}")
+                print(f"  {Colors.DIM}  interval {interval}s  ·  window {window_txt}"
+                      f"  ·  timeout {timeout}s  ·  {via_txt}{Colors.RESET}\n")
 
-                if not probe.get("ok"):
-                    print(f"\n  {Colors.RED}⚠{Colors.RESET} Probe failed: "
-                          f"{probe.get('error') or 'no HTTP/2 SETTINGS frame'}")
-                    print(f"  {Colors.DIM}  ALPN={probe.get('alpn')}  "
-                          f"TLS={probe.get('tls_version')}{Colors.RESET}\n")
+                _INTERRUPTED[0] = False
+                samples, used_proxies, errors, elapsed = \
+                    await cve_run_probe_session(
+                        host, port, interval, duration, timeout, use_proxy)
+
+                if not samples:
+                    print(f"\n  {Colors.RED}⚠{Colors.RESET} No probes completed\n")
+                    safe_input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
+                    continue
+
+                agg = cve_aggregate_samples(samples, host, port)
+
+                if not agg.get("ok"):
+                    print(f"\n  {Colors.BOLD}● PROBE SESSION{Colors.RESET}")
+                    print(f"  {Colors.DIM}{'─' * 76}{Colors.RESET}")
+                    print(f"  {Colors.DIM}├─{Colors.RESET} Samples      "
+                          f"{Colors.BOLD}{len(samples)}{Colors.RESET}")
+                    print(f"  {Colors.DIM}└─{Colors.RESET} Last error   "
+                          f"{Colors.RED}{agg.get('error') or 'no SETTINGS frame'}{Colors.RESET}")
+                    if errors:
+                        print()
+                        print(f"  {Colors.BOLD}● ERROR BREAKDOWN{Colors.RESET}")
+                        for err, cnt in sorted(errors.items(),
+                                               key=lambda kv: -kv[1]):
+                            print(f"  {Colors.DIM}├─{Colors.RESET} "
+                                  f"{Colors.RED}{cnt:>4}x{Colors.RESET}  "
+                                  f"{Colors.DIM}{err[:58]}{Colors.RESET}")
+                    print(f"\n  {Colors.DIM}  No score recorded — target did not"
+                          f" complete an HTTP/2 handshake.{Colors.RESET}\n")
                 else:
-                    score, grade, checks = cve_h2_score(probe)
+                    score, grade, checks = cve_h2_score(agg)
                     clear_screen()
-                    cve_print_probe_report(probe, score, grade, checks)
-                    cve_record_score(probe, score, grade)
+                    cve_print_probe_report(agg, score, grade, checks)
+                    cve_print_session_summary(
+                        samples, agg, used_proxies, elapsed)
+                    cve_record_score(agg, score, grade,
+                                     samples=len(samples),
+                                     success=agg.get("success"),
+                                     proxy=use_proxy)
                     print(f"  {Colors.GREEN}✓{Colors.RESET} Score saved to "
                           f"{Colors.BOLD}{CVE_LEADERBOARD_FILE}{Colors.RESET}\n")
                 safe_input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
