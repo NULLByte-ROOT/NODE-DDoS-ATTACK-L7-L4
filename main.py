@@ -10,9 +10,11 @@ import sys
 import json
 import base64
 import signal
+import socket
 import ssl as ssl_lib
 import calendar
 from datetime import datetime, timedelta, time as dtime
+from urllib.parse import urlparse
 import getpass
 
 try:
@@ -2486,6 +2488,892 @@ NODE_MANAGER = NodeManager()
 SCHEDULE = ScheduleManager()
 
 
+# =====================================================================
+#  CVE ARSENAL — knowledge base + read-only hardening assessment
+# =====================================================================
+#
+#  Design note (university / lab use):
+#  This module intentionally does NOT implement flooding or exploit
+#  payloads. It only:
+#    (a) documents well-known L7 CVEs, and
+#    (b) opens ONE benign HTTP/2 session, reads the server's SETTINGS
+#        frame and closes it again.
+#  No HEADERS and no RST_STREAM are ever sent, so the probe cannot be
+#  used to reproduce CVE-2023-44487 or any other DoS. That keeps the
+#  module safe to run on a lab host while still producing a measurable
+#  "hardening score" that can be compared on a leaderboard.
+#
+
+CVE_LEADERBOARD_FILE = "cve_leaderboard.json"
+
+CVE_CATALOG = [
+    {
+        "id": "CVE-2023-44487",
+        "name": "HTTP/2 Rapid Reset",
+        "aka": "Rapid Reset",
+        "category": "L7 · HTTP/2 DoS",
+        "cvss": "7.5 High",
+        "vector": "AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H",
+        "published": "2023-10-10",
+        "affected": [
+            "nginx (ngx_http_v2)",
+            "Apache HTTP Server (mod_http2)",
+            "Go net/http, Envoy, HAProxy, Caddy, Node.js, ...",
+            "Any HTTP/2 endpoint that does not bound stream resets",
+        ],
+        "summary": (
+            "HTTP/2 lets a client open a stream and cancel it immediately with "
+            "RST_STREAM. A malicious client repeats HEADERS + RST_STREAM at a "
+            "very high rate on a single TCP connection. The server keeps "
+            "allocating per-stream state and scheduling work while the client "
+            "pays almost nothing, so request rate is limited only by the "
+            "connection, not by the remote host. This is a protocol-level "
+            "weakness shared by many independent implementations, which is "
+            "why it received one CVE instead of dozens."
+        ),
+        "mechanism": [
+            "1. Open one TLS + HTTP/2 connection and negotiate h2 via ALPN.",
+            "2. Send HEADERS to create stream N.",
+            "3. Immediately send RST_STREAM(CANCEL) for stream N.",
+            "4. Repeat at line rate; the server never finishes stream N.",
+            "5. Concurrency and reset counters never drain -> resource exhaustion.",
+        ],
+        "impact": (
+            "Origin or edge saturation: 5xx, timeouts, growing queues, "
+            "event-loop stalls and in the worst case process crash. "
+            "Amplification is extreme: one connection can create hundreds of "
+            "thousands of stream lifecycles per second, which is why the "
+            "October 2023 campaign reached record request rates with a small "
+            "botnet."
+        ),
+        "mitigation": [
+            "Patch every HTTP/2 termination point: edge, LB, reverse proxy, origin.",
+            "Cap SETTINGS_MAX_CONCURRENT_STREAMS and enforce the cap server-side.",
+            "Rate-limit RST_STREAM per connection and send GOAWAY(ENHANCE_YOUR_CALM) on abuse.",
+            "Bound per-connection memory/CPU and prefer connection limits at the edge.",
+            "Vendor knobs: nginx http2_max_concurrent_streams, Apache H2MaxSessionStreams, Envoy max_concurrent_streams.",
+        ],
+        "refs": [
+            "https://nvd.nist.gov/vuln/detail/CVE-2023-44487",
+            "https://www.cve.org/CVERecord?id=CVE-2023-44487",
+            "https://blog.cloudflare.com/technical-breakdown-http2-rapid-reset-ddos-attack/",
+        ],
+    },
+    {
+        "id": "CVE-2024-27316",
+        "name": "HTTP/2 CONTINUATION Flood",
+        "aka": "Continuation Flood",
+        "category": "L7 · HTTP/2 DoS",
+        "cvss": "7.5 High",
+        "vector": "AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H",
+        "published": "2024-04-04",
+        "affected": [
+            "Apache HTTP Server 2.4.17 - 2.4.58 (fixed in 2.4.59)",
+            "Other stacks that buffer CONTINUATION frames without a limit",
+        ],
+        "summary": (
+            "An attacker sends an endless chain of CONTINUATION frames without "
+            "the END_HEADERS flag. Implementations that keep buffering header "
+            "blocks die from memory exhaustion long before the request is ever "
+            "complete, and some never even count it as a request, so ordinary "
+            "request-rate limits do not see it."
+        ),
+        "mechanism": [
+            "1. Open an HTTP/2 connection.",
+            "2. Send HEADERS without END_HEADERS.",
+            "3. Keep sending CONTINUATION frames forever.",
+            "4. Server buffers every fragment -> unbounded memory growth.",
+        ],
+        "impact": "Memory exhaustion, worker starvation, OOM kill of the HTTP/2 process.",
+        "mitigation": [
+            "Upgrade to a fixed release.",
+            "Enforce a maximum header block size and maximum CONTINUATION count.",
+            "Reject header blocks above the limit with GOAWAY / RST_STREAM.",
+        ],
+        "refs": [
+            "https://nvd.nist.gov/vuln/detail/CVE-2024-27316",
+            "https://httpd.apache.org/security/vulnerabilities_24.html",
+        ],
+    },
+    {
+        "id": "CVE-2023-43622",
+        "name": "Apache mod_http2 worker starvation",
+        "aka": "Initial window size 0",
+        "category": "L7 · HTTP/2 DoS",
+        "cvss": "7.5 High",
+        "vector": "AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H",
+        "published": "2023-10-19",
+        "affected": [
+            "Apache HTTP Server 2.4.55 - 2.4.57 (fixed in 2.4.58)",
+        ],
+        "summary": (
+            "A client announces INITIAL_WINDOW_SIZE = 0 and then never opens "
+            "the flow-control window. mod_http2 keeps a worker attached while "
+            "waiting for body data that will never arrive, so a small number "
+            "of connections can consume the whole worker pool."
+        ),
+        "mechanism": [
+            "1. Open an HTTP/2 connection to Apache with mod_http2.",
+            "2. Set SETTINGS_INITIAL_WINDOW_SIZE to 0.",
+            "3. Start requests that carry a body and stop sending data.",
+            "4. Workers block waiting for flow-control credit -> pool exhausted.",
+        ],
+        "impact": "Complete denial of service with very few connections.",
+        "mitigation": [
+            "Upgrade to 2.4.58 or later.",
+            "Cap concurrent HTTP/2 streams per connection.",
+            "Put an edge proxy in front that enforces its own flow-control policy.",
+        ],
+        "refs": [
+            "https://nvd.nist.gov/vuln/detail/CVE-2023-43622",
+            "https://httpd.apache.org/security/vulnerabilities_24.html",
+        ],
+    },
+    {
+        "id": "CVE-2024-24549",
+        "name": "Apache Tomcat HTTP/2 request DoS",
+        "aka": "Tomcat h2 request flood",
+        "category": "L7 · HTTP/2 DoS",
+        "cvss": "7.5 High",
+        "vector": "AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H",
+        "published": "2024-03-13",
+        "affected": [
+            "Tomcat 8.5.0 - 8.5.98",
+            "Tomcat 9.0.0-M1 - 9.0.85",
+            "Tomcat 10.0.0-M1 - 10.0.18",
+            "Tomcat 10.1.0-M1 - 10.1.18",
+        ],
+        "summary": (
+            "Tomcat's HTTP/2 request processing accepts an excessive number of "
+            "requests on a single connection. A client can keep thousands of "
+            "requests in flight so that the connector threads and the "
+            "request queue are permanently busy."
+        ),
+        "mechanism": [
+            "1. Open one HTTP/2 connection.",
+            "2. Create far more streams than a browser ever would.",
+            "3. Keep them open without completing them.",
+            "4. Connector threads and queues saturate.",
+        ],
+        "impact": "Service unavailability for legitimate users; possible thread starvation.",
+        "mitigation": [
+            "Upgrade to 8.5.99 / 9.0.86 / 10.1.19 or later.",
+            "Lower maxConcurrentStreams on the HTTP/2 connector.",
+            "Add per-IP connection and stream limits at the edge.",
+        ],
+        "refs": [
+            "https://nvd.nist.gov/vuln/detail/CVE-2024-24549",
+            "https://tomcat.apache.org/security-10.html",
+        ],
+    },
+    {
+        "id": "CVE-2019-9514",
+        "name": "HTTP/2 Reset Flood",
+        "aka": "Reset Flood (Netflix 8)",
+        "category": "L7 · HTTP/2 DoS",
+        "cvss": "7.5 High",
+        "vector": "AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H",
+        "published": "2019-08-13",
+        "affected": [
+            "Many HTTP/2 servers and proxies from 2019 and earlier",
+            "The direct ancestor of CVE-2023-44487",
+        ],
+        "summary": (
+            "One of the eight HTTP/2 denial-of-service findings published by "
+            "Netflix in 2019. A client opens many streams and resets them "
+            "immediately, forcing the server to allocate and free state at an "
+            "unsustainable rate. CVE-2023-44487 is essentially the same idea "
+            "generalised across the whole ecosystem."
+        ),
+        "mechanism": [
+            "1. Open a stream with HEADERS.",
+            "2. Send RST_STREAM immediately.",
+            "3. Repeat on many streams per connection.",
+            "4. Server spends CPU on setup/teardown that the client never pays for.",
+        ],
+        "impact": "CPU exhaustion and request-rate collapse at the origin.",
+        "mitigation": [
+            "Patch (all major vendors shipped fixes in 2019).",
+            "Limit concurrent streams and reset rate per connection.",
+        ],
+        "refs": [
+            "https://nvd.nist.gov/vuln/detail/CVE-2019-9514",
+            "https://github.com/Netflix/security-bulletins/blob/master/advisories/third-party/2019-002.md",
+        ],
+    },
+    {
+        "id": "CVE-2019-9512",
+        "name": "HTTP/2 Ping Flood",
+        "aka": "Ping Flood (Netflix 8)",
+        "category": "L7 · HTTP/2 DoS",
+        "cvss": "7.5 High",
+        "vector": "AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H",
+        "published": "2019-08-13",
+        "affected": [
+            "Many HTTP/2 servers and proxies from 2019 and earlier",
+        ],
+        "summary": (
+            "A client sends a continuous stream of PING frames that the server "
+            "must answer, keeping the event loop busy with cheap work. "
+            "Bandwidth cost for the attacker is tiny compared with the CPU cost "
+            "at the server."
+        ),
+        "mechanism": [
+            "1. Open one HTTP/2 connection.",
+            "2. Send PING frames as fast as possible.",
+            "3. Server must read and ACK every frame.",
+            "4. Event loop is dominated by control-frame handling.",
+        ],
+        "impact": "CPU saturation, latency spikes and eventual timeouts.",
+        "mitigation": [
+            "Patch.",
+            "Rate-limit control frames per connection and per second.",
+            "Close connections that exceed the control-frame budget.",
+        ],
+        "refs": [
+            "https://nvd.nist.gov/vuln/detail/CVE-2019-9512",
+        ],
+    },
+    {
+        "id": "CVE-2023-25690",
+        "name": "Apache mod_proxy request smuggling",
+        "aka": "HTTP request smuggling",
+        "category": "L7 · Integrity / Smuggling",
+        "cvss": "9.8 Critical",
+        "vector": "AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+        "published": "2023-03-07",
+        "affected": [
+            "Apache HTTP Server 2.4.0 - 2.4.55 (fixed in 2.4.56)",
+            "mod_proxy with RewriteRule / ProxyPassMatch using user input",
+        ],
+        "summary": (
+            "Included here for breadth because it is the other classic L7 "
+            "traffic-security failure: when a front proxy and a back end "
+            "disagree about where one HTTP request ends, an attacker can "
+            "smuggle a second request past access controls, poison caches or "
+            "reach internal endpoints."
+        ),
+        "mechanism": [
+            "1. Find a proxy rule that copies user input into the backend URL.",
+            "2. Inject CRLF so a second request is embedded in the first body.",
+            "3. Front end sees one request; back end executes two.",
+            "4. Bypass auth, poison cache or hit internal services.",
+        ],
+        "impact": "Access-control bypass, cache poisoning, credential theft, internal SSRF.",
+        "mitigation": [
+            "Upgrade to 2.4.56 or later.",
+            "Never interpolate raw user input into backend request lines.",
+            "Normalise and reject requests with conflicting framing headers.",
+        ],
+        "refs": [
+            "https://nvd.nist.gov/vuln/detail/CVE-2023-25690",
+            "https://httpd.apache.org/security/vulnerabilities_24.html",
+        ],
+    },
+]
+
+
+_H2_SETTING_NAMES = {
+    0x1: "HEADER_TABLE_SIZE",
+    0x2: "ENABLE_PUSH",
+    0x3: "MAX_CONCURRENT_STREAMS",
+    0x4: "INITIAL_WINDOW_SIZE",
+    0x5: "MAX_FRAME_SIZE",
+    0x6: "MAX_HEADER_LIST_SIZE",
+}
+
+
+def cve_find(cve_id):
+    cid = (cve_id or "").strip().upper()
+    for entry in CVE_CATALOG:
+        if entry["id"].upper() == cid:
+            return entry
+    return None
+
+
+def _h2_frame(ftype, flags, stream_id, payload):
+    return (len(payload).to_bytes(3, "big") +
+            bytes([ftype & 0xFF, flags & 0xFF]) +
+            (int(stream_id) & 0x7FFFFFFF).to_bytes(4, "big") +
+            payload)
+
+
+def _sock_read_exact(sock, n, deadline):
+    chunks = []
+    got = 0
+    while got < n:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("probe deadline reached")
+        sock.settimeout(remaining)
+        chunk = sock.recv(n - got)
+        if not chunk:
+            raise ConnectionError("connection closed by peer")
+        chunks.append(chunk)
+        got += len(chunk)
+    return b"".join(chunks)
+
+
+def h2_hardening_probe(host, port=443, timeout=8.0):
+    """Read-only HTTP/2 SETTINGS probe.
+
+    Opens one TLS connection with ALPN=h2, sends the client preface plus an
+    empty SETTINGS frame, reads the server SETTINGS frame, acknowledges it and
+    closes with GOAWAY. It never sends HEADERS or RST_STREAM, so it cannot
+    generate attack traffic.
+    """
+    result = {
+        "ok": False,
+        "host": host,
+        "port": port,
+        "error": None,
+        "alpn": None,
+        "tls_version": None,
+        "cipher": None,
+        "handshake_ms": 0,
+        "frames": 0,
+        "settings": {},
+        "settings_ack": False,
+        "goaway": False,
+    }
+
+    tls = None
+    try:
+        ctx = ssl_lib.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl_lib.CERT_NONE
+        try:
+            ctx.set_alpn_protocols(["h2"])
+        except Exception:
+            pass
+
+        t0 = time.perf_counter()
+        raw = socket.create_connection((host, port), timeout=timeout)
+        try:
+            tls = ctx.wrap_socket(raw, server_hostname=host)
+        except Exception:
+            try:
+                raw.close()
+            except Exception:
+                pass
+            raise
+
+        result["handshake_ms"] = int((time.perf_counter() - t0) * 1000)
+        result["tls_version"] = tls.version()
+        try:
+            result["cipher"] = (tls.cipher() or [None])[0]
+        except Exception:
+            pass
+        try:
+            result["alpn"] = tls.selected_alpn_protocol()
+        except Exception:
+            pass
+
+        if result["alpn"] != "h2":
+            result["error"] = "ALPN did not select h2 (HTTP/1.1 only or h3 only)"
+            return result
+
+        tls.sendall(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" + _h2_frame(0x4, 0, 0, b""))
+
+        deadline = time.monotonic() + timeout
+        settings = {}
+        frames = 0
+        while frames < 8:
+            try:
+                hdr = _sock_read_exact(tls, 9, deadline)
+            except Exception:
+                break
+            length = int.from_bytes(hdr[0:3], "big")
+            ftype = hdr[3]
+            flags = hdr[4]
+            if length > 1048576:
+                break
+            try:
+                payload = _sock_read_exact(tls, length, deadline) if length else b""
+            except Exception:
+                break
+            frames += 1
+
+            if ftype == 0x4 and not (flags & 0x1):
+                for i in range(0, len(payload) - 5, 6):
+                    key = int.from_bytes(payload[i:i + 2], "big")
+                    val = int.from_bytes(payload[i + 2:i + 6], "big")
+                    settings[key] = val
+                try:
+                    tls.sendall(_h2_frame(0x4, 0x1, 0, b""))
+                    result["settings_ack"] = True
+                except Exception:
+                    pass
+                break
+            if ftype == 0x7:
+                result["goaway"] = True
+                break
+
+        result["settings"] = settings
+        result["frames"] = frames
+        result["ok"] = bool(settings) or frames > 0
+
+        try:
+            tls.sendall(_h2_frame(0x7, 0, 0, (0).to_bytes(4, "big")))
+        except Exception:
+            pass
+
+    except Exception as e:
+        result["error"] = f"{type(e).__name__}: {str(e)[:90]}"
+    finally:
+        if tls is not None:
+            try:
+                tls.close()
+            except Exception:
+                pass
+    return result
+
+
+def cve_h2_score(probe):
+    settings = probe.get("settings") or {}
+    checks = []
+
+    mcs = settings.get(0x3)
+    if mcs is None:
+        checks.append(("MAX_CONCURRENT_STREAMS advertised", 0, 30, "absent"))
+    elif mcs <= 100:
+        checks.append(("MAX_CONCURRENT_STREAMS capped", 30, 30, str(mcs)))
+    elif mcs <= 500:
+        checks.append(("MAX_CONCURRENT_STREAMS capped", 18, 30, str(mcs)))
+    elif mcs <= 1000:
+        checks.append(("MAX_CONCURRENT_STREAMS capped", 8, 30, str(mcs)))
+    else:
+        checks.append(("MAX_CONCURRENT_STREAMS capped", 0, 30, f"{mcs} (very high)"))
+
+    push = settings.get(0x2, 0)
+    checks.append(("HTTP/2 push disabled",
+                   15 if push == 0 else 0, 15, f"ENABLE_PUSH={push}"))
+
+    iws = settings.get(0x4, 65535)
+    checks.append(("INITIAL_WINDOW_SIZE <= 64 KiB",
+                   20 if iws <= 65535 else 0, 20, str(iws)))
+
+    mfs = settings.get(0x5, 16384)
+    checks.append(("MAX_FRAME_SIZE <= 16 KiB",
+                   15 if mfs <= 16384 else 0, 15, str(mfs)))
+
+    hts = settings.get(0x1, 4096)
+    checks.append(("HEADER_TABLE_SIZE <= 4 KiB",
+                   10 if hts <= 4096 else 0, 10, str(hts)))
+
+    tlsv = probe.get("tls_version") or ""
+    checks.append(("TLS 1.3 negotiated",
+                   10 if tlsv.startswith("TLSv1.3") else 0, 10, tlsv or "unknown"))
+
+    total = sum(c[1] for c in checks)
+    if total >= 90:
+        grade = "A"
+    elif total >= 75:
+        grade = "B"
+    elif total >= 60:
+        grade = "C"
+    elif total >= 40:
+        grade = "D"
+    else:
+        grade = "E"
+    return total, grade, checks
+
+
+def cve_load_leaderboard():
+    try:
+        with open(CVE_LEADERBOARD_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return data
+    except Exception:
+        pass
+    return []
+
+
+def cve_save_leaderboard(entries):
+    try:
+        with open(CVE_LEADERBOARD_FILE, "w", encoding="utf-8") as f:
+            json.dump(entries, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def cve_record_score(probe, score, grade):
+    entries = cve_load_leaderboard()
+    host = probe.get("host")
+    port = probe.get("port")
+    entries = [e for e in entries
+               if not (e.get("host") == host and e.get("port") == port)]
+    entries.append({
+        "host": host,
+        "port": port,
+        "score": int(score),
+        "grade": grade,
+        "alpn": probe.get("alpn"),
+        "tls": probe.get("tls_version"),
+        "handshake_ms": probe.get("handshake_ms", 0),
+        "ts": now_dt().strftime("%Y-%m-%d %H:%M:%S"),
+    })
+    entries.sort(key=lambda e: (-int(e.get("score", 0)), str(e.get("host", ""))))
+    entries = entries[:50]
+    cve_save_leaderboard(entries)
+    return entries
+
+
+def cve_parse_target(raw):
+    raw = (raw or "").strip()
+    if not raw:
+        return None, None
+    if any(ch.isspace() for ch in raw):
+        return None, None
+    if "://" not in raw:
+        raw = "https://" + raw
+    try:
+        u = urlparse(raw)
+        host = u.hostname
+        port = u.port or 443
+        if not host or any(ch.isspace() for ch in host):
+            return None, None
+        return host, int(port)
+    except Exception:
+        return None, None
+
+
+def cve_print_catalog():
+    print(f"\n  {Colors.BOLD}● CVE CATALOG{Colors.RESET}  "
+          f"{Colors.DIM}({len(CVE_CATALOG)} entries){Colors.RESET}\n")
+    print(f"  {Colors.DIM}{'#':<3} {'CVE ID':<18} {'CVSS':<12} "
+          f"{'CATEGORY':<28} NAME{Colors.RESET}")
+    print(f"  {Colors.DIM}{'─' * 96}{Colors.RESET}")
+    for i, e in enumerate(CVE_CATALOG, 1):
+        cvss_color = Colors.RED if e["cvss"].startswith("9") else Colors.YELLOW
+        print(f"  {Colors.CYAN}{i:<3}{Colors.RESET} "
+              f"{Colors.BOLD}{e['id']:<18}{Colors.RESET} "
+              f"{cvss_color}{e['cvss']:<12}{Colors.RESET} "
+              f"{Colors.MAGENTA}{e['category']:<28}{Colors.RESET} "
+              f"{e['name']}")
+    print()
+
+
+def cve_print_details(entry):
+    print(f"\n  {Colors.BOLD}{Colors.RED}● {entry['id']}{Colors.RESET}  "
+          f"{Colors.BOLD}{entry['name']}{Colors.RESET}")
+    print(f"  {Colors.DIM}{'─' * 76}{Colors.RESET}")
+    print(f"  {Colors.DIM}├─{Colors.RESET} Alias      {entry['aka']}")
+    print(f"  {Colors.DIM}├─{Colors.RESET} Category   {entry['category']}")
+    print(f"  {Colors.DIM}├─{Colors.RESET} CVSS       "
+          f"{Colors.RED}{entry['cvss']}{Colors.RESET}  "
+          f"{Colors.DIM}({entry['vector']}){Colors.RESET}")
+    print(f"  {Colors.DIM}└─{Colors.RESET} Published  {entry['published']}")
+    print()
+
+    print(f"  {Colors.BOLD}● SUMMARY{Colors.RESET}")
+    for line in _wrap_text(entry["summary"], 74):
+        print(f"  {line}")
+    print()
+
+    print(f"  {Colors.BOLD}● MECHANISM{Colors.RESET}")
+    for step in entry["mechanism"]:
+        print(f"  {Colors.CYAN}{step}{Colors.RESET}")
+    print()
+
+    print(f"  {Colors.BOLD}● IMPACT{Colors.RESET}")
+    for line in _wrap_text(entry["impact"], 74):
+        print(f"  {line}")
+    print()
+
+    print(f"  {Colors.BOLD}● AFFECTED{Colors.RESET}")
+    for item in entry["affected"]:
+        print(f"  {Colors.DIM}├─{Colors.RESET} {item}")
+    print()
+
+    print(f"  {Colors.BOLD}{Colors.GREEN}● MITIGATION{Colors.RESET}")
+    for item in entry["mitigation"]:
+        print(f"  {Colors.GREEN}✓{Colors.RESET} {item}")
+    print()
+
+    print(f"  {Colors.BOLD}● REFERENCES{Colors.RESET}")
+    for ref in entry["refs"]:
+        print(f"  {Colors.DIM}└─{Colors.RESET} {Colors.BLUE}{ref}{Colors.RESET}")
+    print()
+
+
+def _wrap_text(text, width):
+    words = str(text or "").split()
+    lines = []
+    current = ""
+    for w in words:
+        if not current:
+            current = w
+        elif len(current) + 1 + len(w) <= width:
+            current += " " + w
+        else:
+            lines.append(current)
+            current = w
+    if current:
+        lines.append(current)
+    return lines or [""]
+
+
+def cve_print_probe_report(probe, score, grade, checks):
+    print(f"\n  {Colors.BOLD}● HARDENING PROBE REPORT{Colors.RESET}")
+    print(f"  {Colors.DIM}{'─' * 76}{Colors.RESET}")
+    print(f"  {Colors.DIM}├─{Colors.RESET} Target       "
+          f"{Colors.BOLD}{probe['host']}:{probe['port']}{Colors.RESET}")
+    print(f"  {Colors.DIM}├─{Colors.RESET} ALPN         "
+          f"{probe.get('alpn') or '—'}")
+    print(f"  {Colors.DIM}├─{Colors.RESET} TLS          "
+          f"{probe.get('tls_version') or '—'}  "
+          f"{Colors.DIM}{probe.get('cipher') or ''}{Colors.RESET}")
+    print(f"  {Colors.DIM}├─{Colors.RESET} Handshake    "
+          f"{probe.get('handshake_ms', 0)} ms")
+    print(f"  {Colors.DIM}└─{Colors.RESET} Frames read  "
+          f"{probe.get('frames', 0)}")
+    print()
+
+    print(f"  {Colors.BOLD}● SERVER SETTINGS{Colors.RESET}")
+    settings = probe.get("settings") or {}
+    if not settings:
+        print(f"  {Colors.YELLOW}⚠{Colors.RESET} No SETTINGS frame observed")
+    for key, val in sorted(settings.items()):
+        name = _H2_SETTING_NAMES.get(key, f"0x{key:x}")
+        print(f"  {Colors.DIM}├─{Colors.RESET} {name:<26} {Colors.BOLD}{val}{Colors.RESET}")
+    print()
+
+    print(f"  {Colors.BOLD}● RESILIENCE CHECKS{Colors.RESET}")
+    for label, pts, max_pts, detail in checks:
+        if pts >= max_pts:
+            color, mark = Colors.GREEN, "✓"
+        elif pts > 0:
+            color, mark = Colors.YELLOW, "~"
+        else:
+            color, mark = Colors.RED, "✗"
+        print(f"  {color}{mark}{Colors.RESET} {label:<34} "
+              f"{Colors.DIM}{detail:<14}{Colors.RESET}  "
+              f"{color}{pts:>3}/{max_pts}{Colors.RESET}")
+    print()
+
+    grade_color = Colors.GREEN if grade in ("A", "B") else (
+        Colors.YELLOW if grade in ("C", "D") else Colors.RED)
+    print(f"  {Colors.BOLD}● HARDENING SCORE{Colors.RESET}   "
+          f"{Colors.BOLD}{score}/100{Colors.RESET}   "
+          f"grade {grade_color}{Colors.BOLD}{grade}{Colors.RESET}")
+    print(f"  {Colors.DIM}  Remote fingerprint only — it does not prove whether the"
+          f" host is patched.{Colors.RESET}")
+    print()
+
+
+def cve_print_leaderboard():
+    entries = cve_load_leaderboard()
+    print(f"\n  {Colors.BOLD}{Colors.MAGENTA}● HARDENING LEADERBOARD{Colors.RESET}  "
+          f"{Colors.DIM}(competitive mode · {len(entries)} host(s)){Colors.RESET}\n")
+    if not entries:
+        print(f"  {Colors.YELLOW}⚠{Colors.RESET} No scores yet. Run the probe first.\n")
+        return
+
+    print(f"  {Colors.DIM}{'RANK':<6} {'HOST':<34} {'SCORE':>6}  "
+          f"{'GRADE':<6} {'TLS':<9} {'WHEN'}{Colors.RESET}")
+    print(f"  {Colors.DIM}{'─' * 88}{Colors.RESET}")
+    for i, e in enumerate(entries, 1):
+        grade = str(e.get("grade", "?"))
+        gc = Colors.GREEN if grade in ("A", "B") else (
+            Colors.YELLOW if grade in ("C", "D") else Colors.RED)
+        medal = "●" if i == 1 else f"{i:>2}"
+        host = f"{e.get('host', '?')}:{e.get('port', 443)}"
+        if len(host) > 33:
+            host = host[:30] + "..."
+        print(f"  {Colors.CYAN}{medal:<6}{Colors.RESET} {host:<34} "
+              f"{Colors.BOLD}{e.get('score', 0):>6}{Colors.RESET}  "
+              f"{gc}{grade:<6}{Colors.RESET} "
+              f"{Colors.DIM}{str(e.get('tls') or '—'):<9} "
+              f"{e.get('ts', '')}{Colors.RESET}")
+    print()
+    print(f"  {Colors.DIM}  Highest score wins. Re-probing a host replaces its"
+          f" old score.{Colors.RESET}\n")
+
+
+def cve_export_report():
+    ts = now_dt()
+    filename = f"cve_lab_report_{ts.strftime('%Y%m%d_%H%M%S')}.md"
+    lines = [
+        "# BLACKOUT — CVE Lab Report",
+        "",
+        f"- Generated: {ts.strftime('%Y-%m-%d %H:%M:%S')}",
+        "- Scope: L7 traffic-security CVE knowledge base + read-only hardening probe",
+        "- This report contains no attack traffic. The probe only reads the HTTP/2 SETTINGS frame.",
+        "",
+        "## Catalog",
+        "",
+    ]
+    for e in CVE_CATALOG:
+        lines.append(f"### {e['id']} — {e['name']}")
+        lines.append("")
+        lines.append(f"- Alias: {e['aka']}")
+        lines.append(f"- Category: {e['category']}")
+        lines.append(f"- CVSS: {e['cvss']} ({e['vector']})")
+        lines.append(f"- Published: {e['published']}")
+        lines.append(f"- Summary: {e['summary']}")
+        lines.append("- Mitigation:")
+        for m in e["mitigation"]:
+            lines.append(f"  - {m}")
+        lines.append("")
+
+    entries = cve_load_leaderboard()
+    lines.append("## Hardening leaderboard")
+    lines.append("")
+    if entries:
+        lines.append("| Rank | Host | Score | Grade | TLS | Probed at |")
+        lines.append("| --- | --- | --- | --- | --- | --- |")
+        for i, e in enumerate(entries, 1):
+            lines.append(
+                f"| {i} | {e.get('host')}:{e.get('port')} | "
+                f"{e.get('score')} | {e.get('grade')} | "
+                f"{e.get('tls') or '—'} | {e.get('ts')} |"
+            )
+    else:
+        lines.append("_No probes recorded yet._")
+    lines.append("")
+    lines.append("> Educational use only. Only probe hosts you own or are explicitly authorised to test.")
+    lines.append("")
+
+    try:
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+        print(f"\n  {Colors.GREEN}✓{Colors.RESET} Lab report saved  "
+              f"{Colors.DIM}→{Colors.RESET} {Colors.BOLD}{filename}{Colors.RESET}\n")
+    except Exception as e:
+        print(f"\n  {Colors.RED}⚠{Colors.RESET} Failed to write report: {e}\n")
+
+
+async def cve_arsenal_menu():
+    while True:
+        try:
+            clear_screen()
+            print(f"""{Colors.BOLD}{Colors.RED}
+   ██████╗██╗   ██╗███████╗
+  ██╔════╝██║   ██║██╔════╝
+  ██║     ██║   ██║█████╗
+  ██║     ╚██╗ ██╔╝██╔══╝
+  ╚██████╗ ╚████╔╝ ███████╗
+   ╚═════╝  ╚═══╝  ╚══════╝
+{Colors.RESET}{Colors.BOLD}{Colors.DIM}   ── CVE Knowledge Base & Hardening Lab ──{Colors.RESET}
+""")
+
+            entries = len(CVE_CATALOG)
+            board = cve_load_leaderboard()
+            print(f"  {Colors.BOLD}● STATUS{Colors.RESET}")
+            print(f"  {Colors.DIM}├─{Colors.RESET} Catalog entries   "
+                  f"{Colors.BOLD}{Colors.CYAN}{entries:>5}{Colors.RESET}")
+            print(f"  {Colors.DIM}├─{Colors.RESET} Probed hosts      "
+                  f"{Colors.BOLD}{Colors.MAGENTA}{len(board):>5}{Colors.RESET}")
+            print(f"  {Colors.DIM}└─{Colors.RESET} Probe mode        "
+                  f"{Colors.GREEN}read-only{Colors.RESET}  "
+                  f"{Colors.DIM}(SETTINGS only · no HEADERS · no RST_STREAM){Colors.RESET}")
+            print()
+
+            print(f"  {Colors.BOLD}● OPERATIONS{Colors.RESET}")
+            print(f"  {Colors.CYAN}  [1]{Colors.RESET}  Browse CVE catalog              {Colors.DIM}→ all entries{Colors.RESET}")
+            print(f"  {Colors.CYAN}  [2]{Colors.RESET}  CVE details                     {Colors.DIM}→ by ID or index{Colors.RESET}")
+            print(f"  {Colors.GREEN}  [3]{Colors.RESET}  HTTP/2 hardening probe          {Colors.DIM}→ read-only assessment{Colors.RESET}")
+            print(f"  {Colors.MAGENTA}  [4]{Colors.RESET}  Leaderboard                     {Colors.DIM}→ competitive scoring{Colors.RESET}")
+            print(f"  {Colors.YELLOW}  [5]{Colors.RESET}  Export lab report               {Colors.DIM}→ markdown{Colors.RESET}")
+            print(f"  {Colors.DIM}  [0]{Colors.RESET}  Back to main menu")
+            print()
+            print(f"  {Colors.DIM}{'─' * 60}{Colors.RESET}")
+
+            choice = safe_input(f"\n  {Colors.BOLD}➜ Select option: {Colors.RESET}").strip().lower()
+
+            if choice == "0":
+                return
+
+            elif choice == "1":
+                clear_screen()
+                cve_print_catalog()
+                safe_input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
+
+            elif choice == "2":
+                clear_screen()
+                cve_print_catalog()
+                raw = safe_input(
+                    f"  {Colors.BOLD}➜ CVE ID or index [{Colors.GREEN}CVE-2023-44487{Colors.RESET}]: "
+                ).strip()
+                entry = None
+                if not raw:
+                    entry = cve_find("CVE-2023-44487")
+                elif raw.isdigit():
+                    idx = int(raw) - 1
+                    if 0 <= idx < len(CVE_CATALOG):
+                        entry = CVE_CATALOG[idx]
+                else:
+                    entry = cve_find(raw)
+
+                if entry is None:
+                    print(f"\n  {Colors.RED}⚠{Colors.RESET} CVE not found in catalog\n")
+                else:
+                    clear_screen()
+                    cve_print_details(entry)
+                safe_input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
+
+            elif choice == "3":
+                clear_screen()
+                print(f"  {Colors.BOLD}{Colors.GREEN}● HTTP/2 HARDENING PROBE{Colors.RESET}")
+                print(f"  {Colors.DIM}{'─' * 76}{Colors.RESET}")
+                print(f"  {Colors.DIM}  Read-only: negotiates h2, reads the SETTINGS frame,")
+                print(f"  sends GOAWAY and closes. No request and no stream reset")
+                print(f"  is ever sent, so this cannot flood the target.{Colors.RESET}\n")
+                raw = safe_input(
+                    f"  {Colors.BOLD}➜ Target host (e.g. example.com or host:8443): {Colors.RESET}"
+                ).strip()
+                host, port = cve_parse_target(raw)
+                if not host:
+                    print(f"\n  {Colors.RED}⚠{Colors.RESET} Invalid host\n")
+                    safe_input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
+                    continue
+
+                print(f"\n  {Colors.YELLOW}⚠{Colors.RESET}  Only probe hosts you own or are explicitly")
+                print(f"  {Colors.YELLOW}⚠{Colors.RESET}  authorised to test.\n")
+                confirm = safe_input(
+                    f"  {Colors.BOLD}➜ I confirm I have permission for "
+                    f"{host}:{port} (yes/no): {Colors.RESET}"
+                ).strip().lower()
+                if confirm not in ("yes", "y"):
+                    print(f"\n  {Colors.YELLOW}⚠{Colors.RESET} Probe cancelled\n")
+                    safe_input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
+                    continue
+
+                print(f"  {Colors.CYAN}➜ Probing {host}:{port} ...{Colors.RESET}")
+                probe = await asyncio.to_thread(h2_hardening_probe, host, port, 8.0)
+
+                if not probe.get("ok"):
+                    print(f"\n  {Colors.RED}⚠{Colors.RESET} Probe failed: "
+                          f"{probe.get('error') or 'no HTTP/2 SETTINGS frame'}")
+                    print(f"  {Colors.DIM}  ALPN={probe.get('alpn')}  "
+                          f"TLS={probe.get('tls_version')}{Colors.RESET}\n")
+                else:
+                    score, grade, checks = cve_h2_score(probe)
+                    clear_screen()
+                    cve_print_probe_report(probe, score, grade, checks)
+                    cve_record_score(probe, score, grade)
+                    print(f"  {Colors.GREEN}✓{Colors.RESET} Score saved to "
+                          f"{Colors.BOLD}{CVE_LEADERBOARD_FILE}{Colors.RESET}\n")
+                safe_input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
+
+            elif choice == "4":
+                clear_screen()
+                cve_print_leaderboard()
+                safe_input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
+
+            elif choice == "5":
+                clear_screen()
+                cve_export_report()
+                safe_input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
+
+        except MenuBack:
+            print(f"\n  {Colors.YELLOW}⚠{Colors.RESET} Back to main menu")
+            time.sleep(0.4)
+            return
+
+
 def raise_fd_limit():
     try:
         import resource
@@ -3981,6 +4869,7 @@ def main_menu():
             print(f"  {Colors.YELLOW}  [2]{Colors.RESET}  Proxy Management                {Colors.DIM}→ rotation control{Colors.RESET}")
             print(f"  {Colors.MAGENTA}  [3]{Colors.RESET}  Node Management                 {Colors.DIM}→ distributed cluster{Colors.RESET}")
             print(f"  {Colors.GREEN}  [4]{Colors.RESET}  Schedule Management             {Colors.DIM}→ attack time windows{Colors.RESET}")
+            print(f"  {Colors.RED}  [5]{Colors.RESET}  CVE Arsenal                     {Colors.DIM}→ knowledge base + hardening lab{Colors.RESET}")
             print(f"  {Colors.RED}  [0]{Colors.RESET}  Exit")
             print()
 
@@ -4029,6 +4918,13 @@ def main_menu():
             elif choice == "4":
                 try:
                     asyncio.run(schedule_management_menu())
+                except MenuBack:
+                    _restore_terminal()
+                    continue
+                continue
+            elif choice == "5":
+                try:
+                    asyncio.run(cve_arsenal_menu())
                 except MenuBack:
                     _restore_terminal()
                     continue
